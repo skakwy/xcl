@@ -221,6 +221,11 @@ pub mod mirrors {
 /// The console's MEM_64K_PAGES (MEM_LARGE_PAGES | MEM_PHYSICAL): title memory of 64 KiB
 /// pages – GPU-visible on the console like all title memory.
 const MEM_64K_PAGES: u32 = 0x2040_0000;
+/// MEM_LARGE_PAGES: the console's 2 MiB pages of title memory (alone, or in MEM_64K_PAGES)
+const MEM_LARGE_PAGES_X: u32 = 0x2000_0000;
+/// a protection bit of the console's title memory the GPU uses (GTA VI's index and vertex data:
+/// 0x22004; its 2.2 GB block of other data: 0x2404)
+const PAGE_GPU_X: u32 = 0x2_0000;
 
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
@@ -244,9 +249,15 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
         return q;
     }
-    // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
-    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
-        if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
+    // the title's own reservations of 64 KiB or large pages: in a sparse window, so the GPU sees
+    // them (GTA VI keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
+    // the windows the GPU faulted on it – a driver timeout)
+    let large = t & MEM_64K_PAGES != MEM_64K_PAGES && t & MEM_LARGE_PAGES_X != 0 && p & PAGE_GPU_X != 0;
+    if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) {
+        // (large pages: from the highest window down – the title's physical pages, gigabytes
+        // in one piece, keep the lower ones)
+        let top = |u: &crate::gpu::uma::Uma| (1..crate::gpu::uma::MAX_WINDOWS).rev().find_map(|k| u.sparse_alloc_in(k, size, crate::gpu::uma::GRAIN).map(|(q, _)| q));
+        if let Some(q) = uma.and_then(|u| if large { top(u).or_else(|| u.sparse_reserve(size)) } else { u.sparse_reserve(size) }) {
             if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
