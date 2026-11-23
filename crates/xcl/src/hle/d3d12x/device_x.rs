@@ -674,6 +674,12 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // R9G9B9E5_SHAREDEXP targets: the PC renders into the format neither as a target nor through
+    // unordered access (a retail game's 1920x1080 one on the Series S profile, flags 0x300005:
+    // E_INVALIDARG, then its assertion) – half floats hold every shared-exponent value exactly
+    if format == 67 && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -715,6 +721,7 @@ fn depth_typeless(f: u32) -> Option<u32> {
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
+        67 => 10,
         f => pc_view_format(f),
     }
 }
@@ -737,6 +744,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // an R9G9B9E5 target made half floats
+        (10, 67) => 10,
         (_, v) => v,
     }
 }
@@ -1049,6 +1058,12 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
+        x[0x20] = 67; // R9G9B9E5 target that is also a UAV (and console bits): half floats
+        x[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
+        assert_eq!(desc(&x), (10, 0x5));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // a sampled one stays R9G9B9E5
+        assert_eq!(desc(&x), (67, 0));
+        assert_eq!((pc_shader_view_format(10, 67), pc_shader_view_format(67, 67), pc_target_format(67)), (10, 67, 10));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);
