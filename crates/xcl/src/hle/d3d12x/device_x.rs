@@ -887,20 +887,34 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             return hr;
         }
     }
-    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`)
+    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`);
+    // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
-    if !buffer && super::vram::gpu_owned(flags) {
+    let mut placed_hr = None;
+    if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
-        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
-            if hr >= 0 && !(*ppv).is_null() {
-                real::note_title_address(*ppv as usize, va as usize);
+        if super::vram::gpu_owned(flags) {
+            if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
+                if hr >= 0 && !(*ppv).is_null() {
+                    if let Some(bytes) = console_bytes {
+                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                    }
+                    real::note_title_address(*ppv as usize, va as usize);
+                }
+                return hr;
             }
-            return hr;
+        } else {
+            placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+    let hr = match placed_hr {
+        Some(hr) => hr,
+        None => {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
+        }
+    };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {

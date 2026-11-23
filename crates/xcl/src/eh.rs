@@ -247,6 +247,12 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
 
 fn is_writable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    // a committed window of unified memory is read-write as a whole and is not asked about, as in
+    // `gpu::shader::readable`: `VirtualQuery` walks a region to its end to size it, and a title's
+    // memset there asked at every emulated CLZERO loop
+    if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
     found
@@ -291,16 +297,28 @@ fn cmp_eflags(eflags: u32, lhs: u64, rhs: u64) -> u32 {
     f
 }
 
+/// How many of the `most` code bytes at `rip`, where an instruction just raised an exception,
+/// are there to read. The page `rip` is on is – the instruction was fetched from it – so only
+/// bytes on the next page are asked about. `readable` asks `VirtualQuery`, which walks a region
+/// to its end to size it: for a title's code section at every emulated instruction, twice.
+unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
+    let in_page = 0x1000 - (rip & 0xFFF);
+    if in_page >= most {
+        return most;
+    }
+    (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
 unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> i32 {
     use crate::insn::ConsoleOnly;
     let rip = ctx.Rip as usize;
-    if modules::image_base_for_addr(rip).is_none() || !crate::gpu::shader::readable(rip, 1) {
+    if modules::image_base_for_addr(rip).is_none() {
         return 0;
     }
-    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
@@ -1090,6 +1108,47 @@ mod tests {
         unsafe {
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The code bytes of an instruction that raised an exception: its own page without asking,
+    /// the next page only as far as it is there – and an instruction that ends its page, with
+    /// nothing mapped after it, is still emulated.
+    #[test]
+    fn code_bytes_on_the_instructions_page_are_not_asked_about() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let buf = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(code != 0 && buf != 0);
+            // 16 bytes or more left on the page; fewer, with the next page there
+            assert_eq!(code_bytes_at(code + 0x100, 16), 16);
+            assert_eq!(code_bytes_at(code + 0xFF0, 16), 16);
+            assert_eq!(code_bytes_at(code + 0xFFD, 16), 16);
+            // … and with the next page not there: what is left of this one
+            assert_ne!(VirtualFree((code + 0x1000) as *mut _, 0x1000, MEM_DECOMMIT), 0);
+            assert_eq!(code_bytes_at(code + 0xFFD, 16), 3);
+            assert_eq!(code_bytes_at(code + 0xFFF, 16), 1);
+            assert_eq!(code_bytes_at(code + 0x800, 16), 16);
+
+            // clzero in the last three bytes of the page
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "page_end.exe".into(), path: "page_end.exe".into(), base: code, size: 0x2000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            std::ptr::copy_nonoverlapping([0x0Fu8, 0x01, 0xFC].as_ptr(), (code + 0xFFD) as *mut u8, 3);
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x100);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax) = ((code + 0xFFD) as u64, (buf + 0x47) as u64);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip as usize, code + 0x1000);
+            let b = std::slice::from_raw_parts(buf as *const u8, 0x100);
+            assert!(b[0x40..0x80].iter().all(|&x| x == 0) && b[..0x40].iter().chain(&b[0x80..]).all(|&x| x == 0xA5));
+            modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+            VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
     }
 }
