@@ -1100,8 +1100,12 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
-    if let Some(away) = AWAY.lock().unwrap().as_mut() {
+    // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes.
+    // `AWAY` stays held while the homes go (the order AWAY → PHYS_BLOCKS, as in the map calls):
+    // a map, read or write of these pages on another thread must not reach a home released
+    // under it (a plain home is MEM_RELEASEd).
+    let mut held = AWAY.lock().unwrap();
+    if let Some(away) = held.as_mut() {
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
@@ -1128,8 +1132,20 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             } else {
                 mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
             }
+        } else {
+            // the block lives on: the freed page's home gives its memory back now (a lazy home
+            // is committed again when the page number is used: `home_again`)
+            let at = home + (page - first) * PHYS_PAGE;
+            if lazy_home(at) && committed_page(at) {
+                if u.is_sparse(at) {
+                    crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
+                }
+                mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
+            }
         }
     }
+    drop(g);
+    drop(held);
     1
 }
 
@@ -1936,6 +1952,65 @@ mod tests {
             assert_eq!(XMemVirtualQuery(proc_, r, info.as_mut_ptr() as _), 1);
             assert_eq!(info[48] & 3, 0);
             mem::VirtualFree(r, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Freeing one page of a block that lives on gives that page's home back at once (a lazy
+    /// home: a sparse window's or plain memory); its sibling keeps its home and contents.
+    #[test]
+    fn a_freed_page_gives_its_home_back() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return;
+            }
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let homes = [page_home(pages[0]).unwrap(), page_home(pages[1]).unwrap()];
+            if !lazy_home(homes[0]) {
+                return; // a coherent-window home is committed as a whole
+            }
+            assert!(write_physical_pages(&pages, 0, &[1u8; 2 * PHYS_PAGE]));
+            assert!(committed_page(homes[0]) && committed_page(homes[1]));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            assert!(!committed_page(homes[0]), "the freed page's home is decommitted");
+            assert!(committed_page(homes[1]) && page_home(pages[1]) == Some(homes[1]), "its sibling stays");
+            let mut back = [0u8; 4];
+            assert!(read_physical_pages(&pages[1..], 0, &mut back) && back == [1; 4]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+            assert!(page_home(pages[1]).is_none());
+        }
+    }
+
+    /// Allocating, mapping, reading and freeing from several threads at once:
+    /// `FreeTitlePhysicalPages` holds `AWAY` while it releases homes, so no thread resolves a
+    /// page to a home being released.
+    #[test]
+    fn physical_pages_from_several_threads() {
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                std::thread::spawn(move || unsafe {
+                    for k in 0..64u32 {
+                        let mut n = 2usize;
+                        let mut pages = [0usize; 2];
+                        assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+                        let tag = (t << 16 | k).to_le_bytes();
+                        assert!(write_physical_pages(&pages, 8, &tag));
+                        let r = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr());
+                        assert!(!r.is_null());
+                        let mut back = [0u8; 4];
+                        assert!(read_physical_pages(&pages, 8, &mut back));
+                        assert_eq!(back, tag);
+                        assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
         }
     }
 
