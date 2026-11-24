@@ -449,6 +449,8 @@ pub fn local_memory_tight(extra: u64) -> bool {
     if unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local) }.is_err() {
         return false;
     }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: local video memory budget {} MB ({} MB in use)", local.Budget >> 20, local.CurrentUsage >> 20));
     local.CurrentUsage + extra > local.Budget
 }
 
