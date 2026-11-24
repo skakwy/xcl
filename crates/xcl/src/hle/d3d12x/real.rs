@@ -3019,6 +3019,9 @@ unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flag
             g.push(*ppv as usize);
             g.len()
         };
+        if crate::hle::kernelx::waits::tracing() {
+            crate::xlog_info!("D3D12.X: fence #{n} {:p} made (initial value {value:#x}, flags {flags:#x}) at {}", *ppv, crate::hle::kernelx::waits::caller());
+        }
         // `XCL_WATCH_FENCE=n`: writes over the n-th fence's first 8 bytes (its vtable) are logged
         if std::env::var("XCL_WATCH_FENCE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(n) {
             crate::xlog_info!("D3D12.X: fence #{n} {:p} (initial value {value:#x}, flags {flags:#x}) watched", *ppv);

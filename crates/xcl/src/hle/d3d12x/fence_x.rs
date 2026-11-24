@@ -106,6 +106,9 @@ pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) 
         match f.cell {
             Some(c) => return c.0.as_ptr(),
             None => {
+                if crate::hle::kernelx::waits::tracing() {
+                    crate::xlog_info!("D3D12.X: fence {this:p}: the title asks for its completed-value cell at {}", crate::hle::kernelx::waits::caller());
+                }
                 let c: &'static Cell = Box::leak(Box::new(Cell(AtomicU64::new(0))));
                 f.cell = Some(c);
                 (c, f.signalled)

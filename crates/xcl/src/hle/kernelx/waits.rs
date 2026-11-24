@@ -13,6 +13,16 @@ use windows_sys::Win32::System::Threading as th;
 type HANDLE = *mut c_void;
 type BOOL = i32;
 
+/// `XCL_TRACE_WAITS=1` is set
+pub fn tracing() -> bool {
+    on()
+}
+
+/// The title's return addresses above the caller of this function (`module+offset`).
+pub fn caller() -> String {
+    call_site()
+}
+
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_TRACE_WAITS").is_ok_and(|v| v.trim() == "1"))
