@@ -279,7 +279,7 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
                 "DirectStorage: BCPack fill failed: mode {}, {}, destination {:#x} ({} bytes, page offset {})",
                 r.bcpack(),
                 match target {
-                    FillTarget::Pages(p) => format!("{} physical pages", p.len()),
+                    FillTarget::Pages(p) => format!("{} physical pages [{}]", p.len(), p.iter().map(|&x| crate::hle::kernelx::describe_page(x)).collect::<Vec<_>>().join("; ")),
                     FillTarget::Virtual => "virtual".to_string(),
                 },
                 r.destination,

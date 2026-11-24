@@ -953,6 +953,12 @@ pub fn describe_home(va: usize) -> Option<String> {
     ))
 }
 
+/// For a log line: what XCL knows of physical page `page` (its number, home, where it is mapped).
+pub fn describe_page(page: usize) -> String {
+    let away = AWAY.try_lock().ok().and_then(|g| g.as_ref().and_then(|a| a.page.get(&page).copied()));
+    format!("page {page:#x}: index {:?}, home {:?}, away at {away:x?}", page_index(page), page_home(page).map(|h| format!("{h:#x}")))
+}
+
 fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
