@@ -31,8 +31,11 @@ fn event() -> usize {
     static E: OnceLock<usize> = OnceLock::new();
     *E.get_or_init(|| unsafe {
         let e = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize;
+        // (also every few ms without the event: a fence can complete by a path that armed no
+        // event – the title's other fences used to refresh it for it, and a retail game that
+        // waited on that one fence alone while loading its menu scene waited for ever)
         let spawned = std::thread::Builder::new().name("xcl-fences".into()).spawn(move || loop {
-            th::WaitForSingleObject(e as _, th::INFINITE);
+            th::WaitForSingleObject(e as _, 4);
             refresh();
         });
         if let Err(err) = spawned {
