@@ -718,10 +718,21 @@ unsafe fn refresh_once(queue: *mut c_void) {
     // `XCL_WATCH_PER_FRAME=1`: look for CPU writes at the first submit after a present only –
     // a look's cost is the size of the ranges, not the writes found, and a title submits several
     // times a frame; writes not looked for stay reported until the next look (a frame later)
+    // – but never for long: a title that stops presenting while it waits for GPU work fed by its
+    // own CPU writes would wait for ever (a retail game stopped there loading its menu scene)
     static PER_FRAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static LAST_LOOK: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_LOOK_US: AtomicU64 = AtomicU64::new(0);
+    static LOOK_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now_us = LOOK_T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
     let presents = super::present::counters().0;
-    let skip = *PER_FRAME.get_or_init(|| std::env::var("XCL_WATCH_PER_FRAME").is_ok_and(|v| v.trim() == "1")) && LAST_LOOK.swap(presents, Ordering::Relaxed) == presents;
+    let skip = *PER_FRAME.get_or_init(|| std::env::var("XCL_WATCH_PER_FRAME").is_ok_and(|v| v.trim() == "1"))
+        && LAST_LOOK.load(Ordering::Relaxed) == presents
+        && now_us.saturating_sub(LAST_LOOK_US.load(Ordering::Relaxed)) < 25_000;
+    if !skip {
+        LAST_LOOK.store(presents, Ordering::Relaxed);
+        LAST_LOOK_US.store(now_us, Ordering::Relaxed);
+    }
     let ranges = if skip { Arc::new(Vec::new()) } else { cached_watch_ranges(u) };
     {
         static LOOKS: AtomicU64 = AtomicU64::new(0);
