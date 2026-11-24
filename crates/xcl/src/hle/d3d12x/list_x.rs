@@ -1709,6 +1709,12 @@ enum GpuWaitOutcome {
 /// `break_cycles_before_title_signal`) rather than guessing producer queues from previous frames,
 /// so rotating multi-queue schedules neither skip valid barriers nor form Vulkan timeline cycles.
 unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64, u64)]) -> GpuWaitOutcome {
+    // `XCL_WAIT64_GPU_BRIDGE=0`: waits stay on the CPU, as before the bridge (GTA VI: bridged
+    // waits on values recorded but never submitted held its queues 5 s each)
+    static BRIDGE: OnceLock<bool> = OnceLock::new();
+    if !*BRIDGE.get_or_init(|| std::env::var("XCL_WAIT64_GPU_BRIDGE").map_or(true, |v| v.trim() != "0")) {
+        return GpuWaitOutcome::FallbackCpu;
+    }
     if queue.is_null()
         || w.width != 8
         || w.comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32
