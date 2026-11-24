@@ -367,6 +367,15 @@ impl Uma {
         g.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
     }
 
+    /// The nearest reservation/allocation in the sparse windows starting at or below `p` (it may
+    /// end before `p`) and the next one above it – for a crash line; None when the lock is held.
+    pub fn sparse_reservations_around(&self, p: usize) -> Option<(Option<(usize, usize)>, Option<(usize, usize)>)> {
+        let g = self.sparse_free.try_lock().ok()?;
+        let below = g.1.range(..=p).next_back().map(|(&a, &l)| (a, l));
+        let above = g.1.range(p + 1..).next().map(|(&a, &l)| (a, l));
+        Some((below, above))
+    }
+
     /// Bytes currently reserved/allocated in sparse windows.
     pub fn sparse_used(&self) -> usize {
         self.sparse_free.lock().unwrap().1.values().sum()

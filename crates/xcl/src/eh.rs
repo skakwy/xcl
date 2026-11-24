@@ -80,6 +80,10 @@ fn describe_fault_address(a: usize) -> String {
     if let Some(u) = crate::gpu::uma::get() {
         if u.is_sparse(a) {
             s.push_str(", in a sparse window");
+            if let Some((below, above)) = u.sparse_reservations_around(a) {
+                let f = |r: Option<(usize, usize)>| r.map_or("none".to_string(), |(b, l)| format!("{b:#x}+{l:#x}"));
+                s.push_str(&format!(" (reservation at or below: {}{}; next above: {})", f(below), if below.is_some_and(|(b, l)| a < b + l) { ", inside it" } else { ", past its end" }, f(above)));
+            }
             let near = crate::hle::d3d12x::sparse::history_near(a);
             if !near.is_empty() {
                 s.push_str(&format!("; nearby: {}", near.join("; ")));
