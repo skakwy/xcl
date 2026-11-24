@@ -61,6 +61,37 @@ pub fn set_title_filter(f: usize) -> usize {
     TITLE_FILTER.swap(f, Ordering::AcqRel)
 }
 
+/// For a crash line: what the memory at a faulting address is – its Windows state and region,
+/// and which of XCL's parts of the title's memory it lies in.
+fn describe_fault_address(a: usize) -> String {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut s = if unsafe { VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        ", memory not queryable".to_string()
+    } else {
+        let state = match m.State {
+            MEM_COMMIT => "committed",
+            MEM_RESERVE => "reserved",
+            MEM_FREE => "free",
+            _ => "?",
+        };
+        format!(", {state} (protect {:#x}), region {:#x}+{:#x} of allocation {:#x}", m.Protect, m.BaseAddress as usize, m.RegionSize, m.AllocationBase as usize)
+    };
+    if let Some(u) = crate::gpu::uma::get() {
+        if u.is_sparse(a) {
+            s.push_str(", in a sparse window");
+        } else if u.is_committed(a) {
+            s.push_str(", in the coherent window");
+        } else if u.contains(a) {
+            s.push_str(", in unified memory");
+        }
+    }
+    if crate::hle::kernelx::physical_page_at(a) {
+        s.push_str(", a physical page is mapped there away from its home");
+    }
+    s
+}
+
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
@@ -74,7 +105,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            extra = format!(" ({op} at address {:#x}{})", rec.ExceptionInformation[1], describe_fault_address(rec.ExceptionInformation[1]));
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
