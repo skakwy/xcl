@@ -669,7 +669,22 @@ unsafe fn refresh_once(queue: *mut c_void) {
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
-    let ranges = cached_watch_ranges(u);
+    // `XCL_WATCH_PER_FRAME=1`: look for CPU writes at the first submit after a present only –
+    // a look's cost is the size of the ranges, not the writes found, and a title submits several
+    // times a frame; writes not looked for stay reported until the next look (a frame later)
+    static PER_FRAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST_LOOK: AtomicU64 = AtomicU64::new(u64::MAX);
+    let presents = super::present::counters().0;
+    let skip = *PER_FRAME.get_or_init(|| std::env::var("XCL_WATCH_PER_FRAME").is_ok_and(|v| v.trim() == "1")) && LAST_LOOK.swap(presents, Ordering::Relaxed) == presents;
+    let ranges = if skip { Arc::new(Vec::new()) } else { cached_watch_ranges(u) };
+    {
+        static LOOKS: AtomicU64 = AtomicU64::new(0);
+        let n = LOOKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() && n >= 64 {
+            let bytes: usize = ranges.iter().map(|r| r.1).sum();
+            crate::xlog_info!("write-watch look #{n}: {} ranges, {} MB{}", ranges.len(), bytes >> 20, if skip { " (skipped: same frame)" } else { "" });
+        }
+    }
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
