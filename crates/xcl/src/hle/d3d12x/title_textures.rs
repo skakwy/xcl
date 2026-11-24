@@ -663,7 +663,45 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     own_work(|| refresh_once(queue));
 }
 
+/// The `refresh_once` step running now (0: none) and since when (µs since `PHASE_T0`), for
+/// `phase_monitor`, which logs a step that has run a second or more.
+static PHASE: AtomicU64 = AtomicU64::new(0);
+static PHASE_SINCE: AtomicU64 = AtomicU64::new(0);
+static PHASE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+const PHASE_NAMES: [&str; 6] = ["-", "write watch", "sparse upload", "target tile mapping", "texture list", "texture uploads"];
+
+fn enter_phase(k: u64) {
+    let t0 = *PHASE_T0.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("xcl-refresh-monitor".into()).spawn(phase_monitor);
+        std::time::Instant::now()
+    });
+    PHASE_SINCE.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    PHASE.store(k, Ordering::Release);
+}
+
+fn phase_monitor() {
+    let mut reported = (0u64, 0u64);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (k, since) = (PHASE.load(Ordering::Acquire), PHASE_SINCE.load(Ordering::Relaxed));
+        let Some(t0) = PHASE_T0.get() else { continue };
+        let ms = (t0.elapsed().as_micros() as u64).saturating_sub(since) / 1000;
+        if k != 0 && ms >= 1000 && reported != (k, since) {
+            reported = (k, since);
+            crate::xlog_warn!("title textures: the submit's refresh has been in '{}' for {ms} ms", PHASE_NAMES[k as usize]);
+        }
+    }
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            PHASE.store(0, Ordering::Release);
+        }
+    }
+    let _done = Done;
+    enter_phase(1);
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -746,13 +784,16 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
+            enter_phase(2);
             super::sparse::before_execute(q, &dirty, page as usize);
+            enter_phase(3);
             super::vram::before_execute(q);
         });
     }
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
+    enter_phase(4);
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
@@ -780,6 +821,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    enter_phase(5);
     upload_all(todo);
 }
 
