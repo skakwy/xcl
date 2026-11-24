@@ -17,21 +17,35 @@ $root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
 $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
 
-$out = New-TemporaryFile
-$err = New-TemporaryFile
+# Use ProcessStartInfo instead of Start-Process: the latter cannot build its
+# environment block on Windows PowerShell 5.1 when PATH is present twice with
+# different casing (which is possible on Windows).
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $Xcl
+$psi.Arguments = 'run "' + $Game + '"'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+$psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+$p = New-Object System.Diagnostics.Process
+$p.StartInfo = $psi
 $env:XCL_NETWORK = '0'
 $env:XCL_RUN_SECONDS = "$Seconds"
 $env:XCL_ACTIVITY = '1'
-$p = Start-Process -FilePath $Xcl -ArgumentList @('run', "`"$Game`"") -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
-$null = $p.Handle # (without it ExitCode stays empty)
+$null = $p.Start()
+$stdoutTask = $p.StandardOutput.ReadToEndAsync()
+$stderrTask = $p.StandardError.ReadToEndAsync()
 if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
-    Stop-Process -Id $p.Id -Force
+    if (-not $p.HasExited) { $p.Kill() }
     $timedOut = $true
 }
+$p.WaitForExit()
+$stdout = $stdoutTask.Result
+$null = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
-$stdout = Get-Content $out -Raw -Encoding utf8
-Remove-Item $out, $err
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
 $log = ($logLine -replace '^Log:\s+', '').Trim()
@@ -44,7 +58,14 @@ $commits = [regex]::Matches($text, 'memory: (\d+) MB committed') | ForEach-Objec
 $peak = if ($commits) { ($commits | Measure-Object -Maximum).Maximum } else { 'n/a' }
 $removals = ([regex]::Matches($text, 'device removed')).Count
 $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
-$gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name
+# the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
+# not the first one Windows lists – on a machine with an iGPU that is often not the one used
+$gpu = $null
+$report = Join-Path (Split-Path $log -Parent) 'report.json'
+if (Test-Path $report) {
+    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
+}
+if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 @"

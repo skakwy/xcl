@@ -706,10 +706,18 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     let Some(bytes) = count.checked_mul(std::mem::size_of::<usize>()) else {
         return Err(E_ACCESS_VIOLATION);
     };
-    if !crate::gpu::shader::readable(ptr as usize, bytes) {
+    let mut pages = vec![0usize; count];
+    if !read_own(ptr as usize, pages.as_mut_ptr() as *mut u8, bytes) {
         return Err(E_ACCESS_VIOLATION);
     }
-    Ok(std::slice::from_raw_parts(ptr as *const usize, count).to_vec())
+    Ok(pages)
+}
+
+unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0usize;
+    at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.
@@ -1208,7 +1216,8 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     } else {
         // only a file this factory opened
         let f = r.source as *mut c_void;
-        if !crate::gpu::shader::readable(f as usize, 8) || *(f as *const *const usize) != file_vtbl().as_ptr() {
+        let mut vt = 0usize;
+        if !read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) || vt != file_vtbl().as_ptr() as usize {
             return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None, fill: None });
         }
         Some(Arc::clone(inner::<FileInner>(f)))

@@ -71,6 +71,8 @@ pub struct Vfs {
     data_root_lc: String,
     pls_root: PathBuf,
     pls_root_lc: String,
+    /// Other folders XCL itself reads and writes (`own_folder`), absolute and lower-case.
+    own_roots_lc: Vec<String>,
     overlay: String,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
@@ -176,6 +178,7 @@ impl Vfs {
             data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
             pls_root,
             pls_root_lc,
+            own_roots_lc: Vec::new(),
             game_root,
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
             mounts,
@@ -185,6 +188,21 @@ impl Vfs {
             unmapped: Mutex::new(BTreeSet::new()),
             writes: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// `dir` is a folder of XCL's own outside the title's data folder – the shader cache, which
+    /// titles share. A console drive mount must not translate its paths either: with the cache on
+    /// the PC's D: drive ("D:" is the console's game drive) the title's process wrote its DXIL
+    /// into the overlay and looked for it in the game folder, so what `xcl shaders --precompile`
+    /// had put into the cache was never found and every run compiled again.
+    pub fn own_folder(mut self, dir: &Path) -> Vfs {
+        let dir = dir.to_string_lossy();
+        let dir = full_path(&dir).unwrap_or_else(|| dir.into_owned());
+        let dir = trim_sep(&strip_verbatim(&norm(&dir))).to_lowercase();
+        if !dir.is_empty() {
+            self.own_roots_lc.push(dir);
+        }
+        self
     }
 
     pub fn game_root(&self) -> &str {
@@ -287,8 +305,9 @@ impl Vfs {
         }
     }
 
-    /// A path that already names the game folder or XCL's data folder on the PC. A console
-    /// drive mount ("D:") must not translate it when the PC has its folders on that drive.
+    /// A path that already names the game folder or one of XCL's own folders on the PC (the
+    /// title's data, `own_folder`). A console drive mount ("D:") must not translate it when the
+    /// PC has its folders on that drive.
     /// Only a plain drive path counts: "<game>\GAME:\x" still names a console mount.
     fn in_own_folders(&self, p: &str, full: impl Fn(&str) -> Option<String>) -> bool {
         let b = p.as_bytes();
@@ -297,7 +316,7 @@ impl Vfs {
         }
         let Some(abs) = full(p) else { return false };
         let lc = trim_sep(&strip_verbatim(&norm(&abs))).to_lowercase();
-        [&self.game_root_lc, &self.data_root_lc].iter().any(|root| {
+        [&self.game_root_lc, &self.data_root_lc].into_iter().chain(&self.own_roots_lc).any(|root| {
             lc.strip_prefix(root.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
         })
     }
@@ -746,6 +765,33 @@ mod tests {
         let mangled = format!("{drive}\\cwd\\GAME:\\data\\hello.txt");
         assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shader cache on the drive the console's "D:" mount names: without `own_folder` the
+    /// title's process writes it into the overlay (and reads the game folder) – a cache filled
+    /// outside the title, where no mount applies, is not the one it then uses.
+    #[test]
+    fn a_console_drive_mount_leaves_xcls_shader_cache_on_that_drive() {
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_cache_{}", std::process::id()));
+        let game_s = full_path(&dir.join("game").to_string_lossy()).unwrap();
+        let drive = game_s[..2].to_string();
+        let cache = full_path(&dir.join("shader cache").join("dxil").to_string_lossy()).unwrap();
+        let file = format!("{cache}\\0123456789abcdef.dxil");
+        let mounts = || vec![(drive.clone(), game_s.clone())];
+
+        let before = Vfs::new(Path::new(&game_s), &dir.join("xcldata"), mounts());
+        // (the mount's target is the game folder: the cache file is taken for a game file)
+        assert_eq!(before.classify(&file), Target::Game { rel: file[3..].to_string() });
+
+        let v = Vfs::new(Path::new(&game_s), &dir.join("xcldata"), mounts()).own_folder(Path::new(&cache));
+        assert_eq!(v.classify(&file), Target::Pass);
+        assert_eq!(v.classify(&cache), Target::Pass);
+        assert_eq!(v.classify(&format!("{cache}\\translated\\0_Compute_0_4_1.bin")), Target::Pass);
+        // the folder's name is not a prefix of other names, and the rest of the drive is the console's
+        assert_eq!(v.classify(&format!("{cache}2\\x.dxil")), Target::Game { rel: format!("{}2\\x.dxil", &cache[3..]) });
+        assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
+        // a verbatim path (`std::fs::canonicalize`, which the DXIL cache uses for its folder)
+        assert_eq!(v.classify(&format!("\\\\?\\{file}")), Target::Pass);
     }
 
     #[test]

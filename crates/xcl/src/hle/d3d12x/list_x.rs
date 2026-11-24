@@ -1098,7 +1098,7 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.cpu_writes.push((va as usize, words.to_vec()));
+                s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
                 return;
             }
         }
@@ -1111,10 +1111,49 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
 }
 
-/// timestamp queries (one heap per device, used round-robin)
-static TIMESTAMPS: Mutex<Option<HashMap<usize, ID3D12QueryHeap>>> = Mutex::new(None);
+/// timestamp queries (one heap per device, used round-robin) and a lazily created READBACK
+/// buffer for timestamps targeting memory outside unified memory
+struct TimestampPool {
+    heap: ID3D12QueryHeap,
+    /// `(buffer, mapped_base)` of `TIMESTAMP_SLOTS * 8` bytes in a READBACK heap
+    readback: Option<(ID3D12Resource, usize)>,
+}
+
+// SAFETY: D3D12 query heaps and resources are free-threaded COM objects; the persistent
+// readback mapping lives as long as `readback` is held.
+unsafe impl Send for TimestampPool {}
+
+static TIMESTAMPS: Mutex<Option<HashMap<usize, TimestampPool>>> = Mutex::new(None);
 const TIMESTAMP_SLOTS: u32 = 4096;
 static NEXT_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn ensure_timestamp_readback(dev: &ID3D12Device, pool: &mut TimestampPool) -> Option<(ID3D12Resource, usize)> {
+    if let Some((ref buf, base)) = pool.readback {
+        return Some((buf.clone(), base));
+    }
+    let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let rd = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: TIMESTAMP_SLOTS as u64 * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut rb: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).ok()?;
+    let rb = rb?;
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    rb.Map(0, None, Some(&mut ptr)).ok()?;
+    if ptr.is_null() {
+        return None;
+    }
+    let base = ptr as usize;
+    pool.readback = Some((rb.clone(), base));
+    Some((rb, base))
+}
 
 /// The GPU timestamp (the PC queue's ticks) written at `va` when the work before it is done.
 unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
@@ -1123,28 +1162,57 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return warn(&N, what, format_args!("a timestamp on a type-{} list", ty.0));
     }
-    let Some((d, off)) = real::uma_window_buffer(va as usize, 8).filter(|_| va.is_multiple_of(8)) else {
-        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned in unified memory"));
-    };
+    if !va.is_multiple_of(8) {
+        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned"));
+    }
+    let uma_dst = real::uma_window_buffer(va as usize, 8);
+    if uma_dst.is_none() && !super::cpu_writes::writable(va as usize, 8) {
+        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    }
     let Some(dev) = device_of(list) else { return };
-    let heap = {
+    let (heap, readback) = {
         let mut m = TIMESTAMPS.lock().unwrap();
         let m = m.get_or_insert_with(HashMap::new);
-        if let std::collections::hash_map::Entry::Vacant(slot) = m.entry(dev.as_raw() as usize) {
-            let mut h: Option<ID3D12QueryHeap> = None;
-            let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: TIMESTAMP_SLOTS, NodeMask: 0 };
-            match dev.CreateQueryHeap(&desc, &mut h) {
-                Ok(()) if h.is_some() => slot.insert(h.unwrap()),
-                _ => return warn(&N, what, format_args!("no timestamp query heap")),
-            };
-        }
-        m[&(dev.as_raw() as usize)].as_raw() as usize
+        let pool = match m.entry(dev.as_raw() as usize) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let mut h: Option<ID3D12QueryHeap> = None;
+                let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: TIMESTAMP_SLOTS, NodeMask: 0 };
+                match dev.CreateQueryHeap(&desc, &mut h) {
+                    Ok(()) if h.is_some() => slot.insert(TimestampPool { heap: h.unwrap(), readback: None }),
+                    _ => return warn(&N, what, format_args!("no timestamp query heap")),
+                }
+            }
+        };
+        let rb = if uma_dst.is_none() {
+            match ensure_timestamp_readback(&dev, pool) {
+                Some(rb) => Some(rb),
+                None => return warn(&N, what, format_args!("no timestamp readback buffer")),
+            }
+        } else {
+            None
+        };
+        (pool.heap.as_raw() as usize, rb)
     };
-    note_write(list as usize, va, 8);
     let i = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS;
-    pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+    if let Some((d, off)) = uma_dst {
+        note_write(list as usize, va, 8);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+        as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+    } else if let Some((rb, base)) = readback {
+        // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
+            return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+        };
+        let rb_raw = rb.as_raw() as usize;
+        let off = i as u64 * 8;
+        s.cpu_writes.push(super::cpu_writes::Write::ReadbackU64 { va: va as usize, src: base + off as usize, _buf: rb });
+        drop(g);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+        pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
+    }
 }
 
 /// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
@@ -3634,5 +3702,83 @@ mod tests {
         on_release(list_key);
         assert!(!has_list_state(list_key));
         assert_eq!(fake_res.refs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Write64BitValueBottomOfPipeX / Write64BitValueTopOfPipeX with timestamp flags targeting
+    /// writable memory outside unified memory resolve through the timestamp readback buffer and
+    /// land once the queue completes. Unaligned and unwritable addresses are ignored.
+    #[test]
+    fn timestamps_outside_unified_memory_land_after_the_queue() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+
+            let list_ptr = list.as_raw();
+            let orig_vt = *(list_ptr as *const *const usize);
+            let mut ext_vt = [0usize; 65];
+            ext_vt[0] = orig_vt as usize;
+            std::ptr::copy_nonoverlapping(orig_vt, ext_vt.as_mut_ptr().add(1), 64);
+
+            on_create(list_ptr, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            *(list_ptr as *mut *const usize) = ext_vt.as_ptr().add(1);
+
+            let bottom_ts = Box::new(0u64);
+            let top_ts = Box::new(0u64);
+            let bottom_va = bottom_ts.as_ref() as *const u64 as u64;
+            let top_va = top_ts.as_ref() as *const u64 as u64;
+
+            // Unaligned and null targets are ignored without queueing CPU writes.
+            write64_bottom_x(list_ptr, bottom_va + 4, 0, 0, BOTTOM_TIMESTAMPS);
+            write64_bottom_x(list_ptr, 0, 0, 0, BOTTOM_TIMESTAMPS);
+            {
+                let g = LISTS.lock().unwrap();
+                assert!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.is_empty());
+            }
+
+            // Valid 8-byte aligned non-UMA targets record GPU timestamp queries + readback copies.
+            write64_top_x(list_ptr, top_va, 0, TOP_TIMESTAMPS);
+            write64_bottom_x(list_ptr, bottom_va, 0, 0, BOTTOM_TIMESTAMPS);
+            {
+                let g = LISTS.lock().unwrap();
+                assert_eq!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.len(), 2);
+            }
+
+            // Restore the real vtable before closing and executing on the PC queue.
+            *(list_ptr as *mut *const usize) = orig_vt;
+            list.Close().unwrap();
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            q.ExecuteCommandLists(&[Some(cl)]);
+            cpu_writes_after(q.as_raw(), &[list_ptr]);
+
+            let t = Instant::now();
+            while (*(bottom_va as *const AtomicU64)).load(Ordering::Acquire) == 0 || (*(top_va as *const AtomicU64)).load(Ordering::Acquire) == 0 {
+                assert!(t.elapsed().as_secs() < 5, "non-UMA GPU timestamp never landed (top={}, bottom={})", *top_ts, *bottom_ts);
+                std::thread::yield_now();
+            }
+            assert_ne!(*top_ts, 0);
+            assert_ne!(*bottom_ts, 0);
+
+            on_release(list_ptr as usize);
+        }
     }
 }
