@@ -75,10 +75,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let k = crate::hle::d3d12x::vram::target_stats();
                 if k.iter().any(|x| x[0] > 0) {
                     crate::xlog_info!(
-                        "texture targets: GPU-owned {} ({} MB held, {} MB untouched 10 s, {} evicted); CPU-filled {} ({} MB, {} MB, {}); made for views {} ({} MB, {} MB, {})",
-                        k[0][0], mb(k[0][1] as u64), mb(k[0][2] as u64), k[0][3],
-                        k[1][0], mb(k[1][1] as u64), mb(k[1][2] as u64), k[1][3],
-                        k[2][0], mb(k[2][1] as u64), mb(k[2][2] as u64), k[2][3]
+                        "texture targets: GPU-owned {} ({} MB held, {} MB untouched 10 s, {} evicted, {} MB not evictable); CPU-filled {} ({} MB, {} MB, {}, {} MB); made for views {} ({} MB, {} MB, {}, {} MB)",
+                        k[0][0], mb(k[0][1] as u64), mb(k[0][2] as u64), k[0][3], mb(k[0][4] as u64),
+                        k[1][0], mb(k[1][1] as u64), mb(k[1][2] as u64), k[1][3], mb(k[1][4] as u64),
+                        k[2][0], mb(k[2][1] as u64), mb(k[2][2] as u64), k[2][3], mb(k[2][4] as u64)
                     );
                 }
                 crate::xlog_info!(

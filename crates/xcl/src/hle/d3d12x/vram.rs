@@ -865,11 +865,12 @@ const STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Per kind (`TargetKind::GpuOwned`, `CpuFilled`, `View`): live targets, bytes of the tiles
 /// they hold (a page shared by several counts for each) and of those untouched for `STALE`,
-/// and evicted targets – `XCL_ACTIVITY`.
-pub fn target_stats() -> [[usize; 4]; 3] {
+/// evicted targets, and bytes held by mapped targets the page budget may not evict (GPU-filled)
+/// – `XCL_ACTIVITY`.
+pub fn target_stats() -> [[usize; 5]; 3] {
     let g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
-    let mut out = [[0usize; 4]; 3];
+    let mut out = [[0usize; 5]; 3];
     for p in g.values().flatten() {
         for t in p.targets.values() {
             let o = &mut out[t.kind as usize];
@@ -882,6 +883,9 @@ pub fn target_stats() -> [[usize; 4]; 3] {
             o[1] += bytes;
             if now.duration_since(t.touched) >= STALE {
                 o[2] += bytes;
+            }
+            if !t.evictable {
+                o[4] += bytes;
             }
         }
     }
