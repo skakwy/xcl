@@ -80,6 +80,10 @@ fn describe_fault_address(a: usize) -> String {
     if let Some(u) = crate::gpu::uma::get() {
         if u.is_sparse(a) {
             s.push_str(", in a sparse window");
+            let near = crate::hle::d3d12x::sparse::history_near(a);
+            if !near.is_empty() {
+                s.push_str(&format!("; nearby: {}", near.join("; ")));
+            }
         } else if u.is_committed(a) {
             s.push_str(", in the coherent window");
         } else if u.contains(a) {

@@ -1309,7 +1309,39 @@ pub unsafe fn readback_now(va: usize, len: usize) {
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
 /// lie outside the range are not committed (holes); the range's pages are.
+/// The last commits and decommits in the sparse windows (`committed` / `decommitted`): start,
+/// end, commit or not, and the return addresses of the callers – what a crash line lists near a
+/// faulting address (`history_near`).
+static HISTORY: std::sync::Mutex<std::collections::VecDeque<(usize, usize, bool, [usize; 4])>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+const HISTORY_LEN: usize = 65536;
+
+fn note_history(a: usize, n: usize, commit: bool) {
+    let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 4];
+    unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(2, 4, frames.as_mut_ptr(), std::ptr::null_mut()) };
+    let mut h = HISTORY.lock().unwrap();
+    if h.len() >= HISTORY_LEN {
+        h.pop_front();
+    }
+    h.push_back((a, a.saturating_add(n), commit, frames.map(|f| f as usize)));
+}
+
+/// For a crash line: the last commits / decommits (up to 6) that touched `[a - 1 MiB, a + 1 MiB)`.
+pub fn history_near(a: usize) -> Vec<String> {
+    let Ok(h) = HISTORY.try_lock() else { return vec!["(history busy)".into()] };
+    let (lo, hi) = (a.saturating_sub(1 << 20), a.saturating_add(1 << 20));
+    h.iter()
+        .rev()
+        .filter(|e| e.0 < hi && e.1 > lo)
+        .take(6)
+        .map(|e| {
+            let by: Vec<String> = e.3.iter().filter(|&&f| f != 0).map(|&f| crate::modules::describe_address(f)).collect();
+            format!("{} {:#x}..{:#x} by {}", if e.2 { "commit" } else { "decommit" }, e.0, e.1, by.join(" < "))
+        })
+        .collect()
+}
+
 pub unsafe fn committed(a: usize, n: usize) {
+    note_history(a, n, true);
     if n == 0 {
         return;
     }
@@ -1326,6 +1358,7 @@ pub unsafe fn committed(a: usize, n: usize) {
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
 /// (unless a placed buffer still pins the pool tile).
 pub unsafe fn decommitted(a: usize, n: usize) {
+    note_history(a, n, false);
     if n == 0 {
         return;
     }
