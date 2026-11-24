@@ -300,6 +300,8 @@ struct Pages {
     evict_after: Option<std::time::Instant>,
     /// title queue → a fence signalled after its submitted work, used to order unmaps
     queue_fences: std::collections::HashMap<usize, (ID3D12Fence, u64)>,
+    /// one 64 KiB page every unmapped tile points at (`unmap`), made at the first unmap
+    blank: Option<ID3D12Heap>,
 }
 
 // D3D12 objects are free-threaded
@@ -335,6 +337,7 @@ impl Pages {
             waited: std::collections::HashMap::new(),
             evict_after: None,
             queue_fences: std::collections::HashMap::new(),
+            blank: None,
         })
     }
 
@@ -481,16 +484,36 @@ impl Pages {
         }
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
-        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        // every tile on one blank page rather than none: a descriptor the title still uses after
+        // the texture gave its pages up (a newer placement at its address, or the page budget)
+        // reads that page – a tile mapped to nothing faulted on NVIDIA (GTA VI: DRED page fault in
+        // a view-made target, "mapped false, evicted false", device removed at 381 s)
+        if self.blank.is_none() {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: PAGE as u64,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_NONE,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            if self.device.CreateHeap(&desc, &mut heap).is_ok() {
+                self.blank = heap;
+            }
+        }
+        let offset = 0u32;
+        let (flag, heap) = match &self.blank {
+            Some(h) => (D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE, Some(h)),
+            None => (D3D12_TILE_RANGE_FLAG_NULL, None),
+        };
         self.queue.UpdateTileMappings(
             res,
             1,
             Some(&coord),
             Some(&region),
-            None,
+            heap,
             1,
             Some(&flag),
-            None,
+            Some(&offset),
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
