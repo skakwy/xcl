@@ -747,6 +747,10 @@ unsafe fn place_on_pages(
     let kind = if require_aligned { TargetKind::GpuOwned } else { TargetKind::CpuFilled };
     pages.targets.insert(raw as usize, Target { kind, va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now() });
     drop(g);
+    // `XCL_DRED`: the name DRED reports for a page fault in it (`describe_target`)
+    if std::env::var_os("XCL_DRED").is_some() {
+        let _ = res.SetName(&windows::core::HSTRING::from(format!("xcl target {:#x}", raw as usize)));
+    }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
 }
@@ -801,6 +805,27 @@ pub(super) fn take_evicted(res: usize) -> bool {
 /// Page budget: whether any texture is evicted (callers skip the lookup otherwise).
 pub(super) fn any_evicted() -> bool {
     EVICTED.lock().unwrap().as_ref().is_some_and(|s| !s.is_empty())
+}
+
+/// For a device removal report: what XCL knows of the target `res` (named `xcl target <res>` under
+/// `XCL_DRED`). None: not a target, or the pages are locked.
+pub fn describe_target(res: usize) -> Option<String> {
+    let evicted = EVICTED.try_lock().ok()?.as_ref().is_some_and(|s| s.contains(&res));
+    let g = PAGES.try_lock().ok()?;
+    let t = g.values().flatten().find_map(|p| p.targets.get(&res))?;
+    let kind = match t.kind {
+        TargetKind::GpuOwned => "GPU-owned",
+        TargetKind::CpuFilled => "CPU-filled",
+        TargetKind::View => "view",
+    };
+    Some(format!(
+        "{kind} at title {:#x}, {} tiles, mapped {}, evicted {evicted}, evictable {}, last used {:.1} s ago",
+        t.va,
+        t.total,
+        t.mapped,
+        t.evictable,
+        t.touched.elapsed().as_secs_f32()
+    ))
 }
 
 /// `res` was used (a transition the title submitted): later to be evicted.

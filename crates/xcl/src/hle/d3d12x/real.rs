@@ -5296,6 +5296,19 @@ pub fn log_device_removed() {
             let va = pf.PageFaultVA;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            // the textures XCL placed on the title's pages are named `xcl target <res>`
+            let mut n = pf.pHeadExistingAllocationNode;
+            while !n.is_null() {
+                let a = &*n;
+                if !a.ObjectNameA.is_null() {
+                    let name = std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy();
+                    if let Some(key) = name.strip_prefix("xcl target 0x").and_then(|h| usize::from_str_radix(h, 16).ok()) {
+                        let what = super::vram::describe_target(key).unwrap_or_else(|| "gone or locked".into());
+                        crate::xlog_error!("DRED page fault: {name} is a {what}");
+                    }
+                }
+                n = a.pNext;
+            }
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
             let mut n = bc.pHeadAutoBreadcrumbNode;
