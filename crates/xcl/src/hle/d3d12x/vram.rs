@@ -238,7 +238,19 @@ fn sweep_idle(
     }
 }
 
+/// What made a target (`XCL_ACTIVITY` counts them apart; the page budget treats them apart).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TargetKind {
+    /// a render target / depth buffer / UAV texture of the title (`place`): the GPU fills it
+    GpuOwned,
+    /// a texture the CPU fills (`place_pages`): its texels can be uploaded again
+    CpuFilled,
+    /// made by XCL for a view of memory without a resource (`real::resource_at`, device #70/#71)
+    View,
+}
+
 struct Target {
+    kind: TargetKind,
     va: usize,
     console_bytes: Option<u64>,
     total: u32,
@@ -633,7 +645,8 @@ unsafe fn place_on_pages(
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now() });
+    let kind = if require_aligned { TargetKind::GpuOwned } else { TargetKind::CpuFilled };
+    pages.targets.insert(raw as usize, Target { kind, va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now() });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -728,6 +741,45 @@ pub(super) fn pin(res: usize) {
             return;
         }
     }
+}
+
+/// `res` was made for a view of memory without a resource (`real::resource_at`).
+pub(super) fn mark_view(res: usize) {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.kind = TargetKind::View;
+            return;
+        }
+    }
+}
+
+/// Targets not touched for this long count as stale in `target_stats`.
+const STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per kind (`TargetKind::GpuOwned`, `CpuFilled`, `View`): live targets, bytes of the tiles
+/// they hold (a page shared by several counts for each) and of those untouched for `STALE`,
+/// and evicted targets – `XCL_ACTIVITY`.
+pub fn target_stats() -> [[usize; 4]; 3] {
+    let g = PAGES.lock().unwrap();
+    let now = std::time::Instant::now();
+    let mut out = [[0usize; 4]; 3];
+    for p in g.values().flatten() {
+        for t in p.targets.values() {
+            let o = &mut out[t.kind as usize];
+            o[0] += 1;
+            if !t.mapped {
+                o[3] += 1;
+                continue;
+            }
+            let bytes = (t.used.len() + t.used_extra.len()) * PAGE;
+            o[1] += bytes;
+            if now.duration_since(t.touched) >= STALE {
+                o[2] += bytes;
+            }
+        }
+    }
+    out
 }
 
 /// Page budget: (textures evicted, textures mapped again) so far.

@@ -72,6 +72,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
+                let k = crate::hle::d3d12x::vram::target_stats();
+                if k.iter().any(|x| x[0] > 0) {
+                    crate::xlog_info!(
+                        "texture targets: GPU-owned {} ({} MB held, {} MB untouched 10 s, {} evicted); CPU-filled {} ({} MB, {} MB, {}); made for views {} ({} MB, {} MB, {})",
+                        k[0][0], mb(k[0][1] as u64), mb(k[0][2] as u64), k[0][3],
+                        k[1][0], mb(k[1][1] as u64), mb(k[1][2] as u64), k[1][3],
+                        k[2][0], mb(k[2][1] as u64), mb(k[2][2] as u64), k[2][3]
+                    );
+                }
                 crate::xlog_info!(
                     "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
                     mb(private as u64),

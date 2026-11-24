@@ -2116,6 +2116,8 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
             crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
         }
         r = std::ptr::null_mut();
+    } else {
+        super::vram::mark_view(r as usize);
     }
     MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
     r
