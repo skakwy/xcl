@@ -5380,7 +5380,13 @@ pub fn log_device_removed() {
                 let mut v = Vec::new();
                 while !n.is_null() && v.len() < 8 {
                     let a = &*n;
-                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
+                    let name = if !a.ObjectNameA.is_null() {
+                        std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned()
+                    } else if !a.ObjectNameW.is_null() {
+                        a.ObjectNameW.to_string().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     v.push(format!("type {} {}", a.AllocationType.0, name));
                     n = a.pNext;
                 }
@@ -5393,8 +5399,9 @@ pub fn log_device_removed() {
             let mut n = pf.pHeadExistingAllocationNode;
             while !n.is_null() {
                 let a = &*n;
-                if !a.ObjectNameA.is_null() {
-                    let name = std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy();
+                let wide = if a.ObjectNameW.is_null() { String::new() } else { a.ObjectNameW.to_string().unwrap_or_default() };
+                if !a.ObjectNameA.is_null() || !wide.is_empty() {
+                    let name = if a.ObjectNameA.is_null() { wide.clone().into() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy() };
                     if let Some(key) = name.strip_prefix("xcl target 0x").and_then(|h| usize::from_str_radix(h, 16).ok()) {
                         let what = super::vram::describe_target(key).unwrap_or_else(|| "gone or locked".into());
                         crate::xlog_error!("DRED page fault: {name} is a {what}");
