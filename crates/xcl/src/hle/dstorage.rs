@@ -765,8 +765,24 @@ pub fn counters() -> (u64, u64, u64) {
 }
 
 /// Run a request; the destination gets the bytes or nothing.
+/// µs spent per request phase (`execute`): [writable check, source read, inflate, destination write, requests]
+static PHASE_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn phase(i: usize, t: std::time::Instant) -> std::time::Instant {
+    PHASE_US[i].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    std::time::Instant::now()
+}
+
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
+    let t = std::time::Instant::now();
+    {
+        let k = PHASE_US[4].fetch_add(1, Ordering::Relaxed) + 1;
+        if k.is_power_of_two() && k >= 256 {
+            let us = |i: usize| PHASE_US[i].load(Ordering::Relaxed) / 1000;
+            crate::xlog_info!("DirectStorage timing after {k} requests: writable check {} ms, source read {} ms, inflate {} ms, destination write {} ms", us(0), us(1), us(2), us(3));
+        }
+    }
     {
         // the first requests: where a title's data goes and how it is packed
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -790,6 +806,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
+    let t = phase(0, t);
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
@@ -813,6 +830,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
+    let t = phase(1, t);
     if r.swizzle() != 0 || r.bcpack() != 0 {
         return Err(E_DECOMPRESSION);
     }
@@ -830,6 +848,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else {
         src
     };
+    let t = phase(2, t);
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -851,6 +870,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
+    phase(3, t);
     Ok(())
 }
 
