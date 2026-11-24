@@ -530,6 +530,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
         let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
         let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+        start_monitor(fence.clone(), rb_fence.clone());
         Ok(State {
             dev: dev.clone(),
             queue,
@@ -843,6 +844,7 @@ impl State {
     unsafe fn signal(&mut self) {
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        SIGNALLED.fetch_max(self.value, Ordering::AcqRel);
     }
 
     #[inline]
@@ -1290,6 +1292,48 @@ pub unsafe fn free(p: usize) -> bool {
 pub fn queue() -> Option<ID3D12CommandQueue> {
     STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
 }
+
+/// The sparse queue's fence and the readback fence, watched by a thread of their own: when the
+/// queue has not moved for 3 s, what it may wait for is logged (a thread stuck in a submission to
+/// it – the driver holds submissions to a queue that waits – cannot say).
+fn start_monitor(fence: ID3D12Fence, rb_fence: ID3D12Fence) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(move || {
+        let _ = std::thread::Builder::new().name("xcl-sparse-monitor".into()).spawn(move || {
+            let (mut last, mut since, mut told) = (0u64, std::time::Instant::now(), false);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let done = unsafe { fence.GetCompletedValue() };
+                if done != last {
+                    (last, since, told) = (done, std::time::Instant::now(), false);
+                    continue;
+                }
+                let behind = SIGNALLED.load(Ordering::Acquire) > done;
+                if behind && !told && since.elapsed().as_secs() >= 3 {
+                    told = true;
+                    let rb_done = unsafe { rb_fence.GetCompletedValue() };
+                    let pending: Vec<String> = RB_WAITS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|w| w.0 > rb_done)
+                        .map(|w| format!("#{} from q{} {:.1} s ago", w.0, super::list_x::queue_label(w.1), w.2.elapsed().as_secs_f32()))
+                        .collect();
+                    crate::xlog_warn!(
+                        "sparse monitor: the queue is at {done} of {} for {:.1} s; readbacks done to #{rb_done}, waiting for [{}]; armed GPU waits: [{}]",
+                        SIGNALLED.load(Ordering::Acquire),
+                        since.elapsed().as_secs_f32(),
+                        pending.join(", "),
+                        super::list_x::armed_summary()
+                    );
+                }
+            }
+        });
+    });
+}
+
+/// The highest value the sparse queue was told to signal (`State::signal`).
+static SIGNALLED: AtomicU64 = AtomicU64::new(0);
 
 /// The last readbacks the sparse queue was told to wait for: (rb fence value, title queue, when).
 static RB_WAITS: Mutex<std::collections::VecDeque<(u64, usize, std::time::Instant)>> = Mutex::new(std::collections::VecDeque::new());
