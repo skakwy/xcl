@@ -717,11 +717,8 @@ pub(super) fn any_evicted() -> bool {
     EVICTED.lock().unwrap().as_ref().is_some_and(|s| !s.is_empty())
 }
 
-/// Page budget: `res` was used (a transition the title submitted): later to be evicted.
+/// `res` was used (a transition the title submitted): later to be evicted.
 pub(super) fn touch(res: usize) {
-    if pool_cap() == 0 {
-        return;
-    }
     let mut g = PAGES.lock().unwrap();
     for pages in g.values_mut().flatten() {
         if let Some(t) = pages.targets.get_mut(&res) {
@@ -739,6 +736,62 @@ pub(super) fn pin(res: usize) {
         if let Some(t) = pages.targets.get_mut(&res) {
             t.evictable = false;
             return;
+        }
+    }
+}
+
+/// PC command list → the placed textures it named (barriers, render targets) since it was made
+/// or last reset: they count as used each time the list is submitted (`submitting`).
+static LIST_USES: Mutex<std::collections::BTreeMap<usize, Vec<usize>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// PC list `list` named `resources` (a barrier, a render-target bind): the placed textures among
+/// them are noted for when it is submitted.
+pub(super) fn note_uses(list: usize, resources: impl IntoIterator<Item = usize>) {
+    let kept: Vec<usize> = {
+        let g = PLACED_TEXTURES.lock().unwrap();
+        let Some(placed) = g.as_ref() else { return };
+        resources.into_iter().filter(|r| placed.contains(r)).collect()
+    };
+    if kept.is_empty() {
+        return;
+    }
+    let mut g = LIST_USES.lock().unwrap();
+    let v = g.entry(list).or_default();
+    for r in kept {
+        // a list names the same target again and again (a barrier each pass)
+        if !v.contains(&r) {
+            v.push(r);
+        }
+    }
+}
+
+/// PC list `list` starts a new recording (made, reset, released): its noted uses go.
+pub(super) fn list_reset(list: usize) {
+    let mut g = LIST_USES.lock().unwrap();
+    if !g.is_empty() {
+        g.remove(&list);
+    }
+}
+
+/// The PC lists `lists` are about to be submitted: the targets they named are used now.
+pub(super) fn submitting(lists: &[*mut c_void]) {
+    let used: Vec<usize> = {
+        let g = LIST_USES.lock().unwrap();
+        if g.is_empty() {
+            return;
+        }
+        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect()
+    };
+    if used.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        for r in &used {
+            if let Some(t) = pages.targets.get_mut(r) {
+                t.touched = now;
+            }
         }
     }
 }
@@ -902,6 +955,22 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// A list notes the placed textures it names (once each), not other resources; a reset of
+    /// the list drops them.
+    #[test]
+    fn a_list_notes_the_placed_textures_it_uses_until_it_is_reset() {
+        let (placed, other, list) = (0x7e57_0001usize, 0x7e57_0002usize, 0x7e57_0100usize);
+        PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(placed);
+        note_uses(list, [placed, other, placed]);
+        note_uses(list, [placed]);
+        assert_eq!(LIST_USES.lock().unwrap().get(&list), Some(&vec![placed]));
+        list_reset(list);
+        assert!(LIST_USES.lock().unwrap().get(&list).is_none());
+        note_uses(list, [other]);
+        assert!(LIST_USES.lock().unwrap().get(&list).is_none(), "nothing noted for a list naming no placed texture");
+        PLACED_TEXTURES.lock().unwrap().as_mut().unwrap().remove(&placed);
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]

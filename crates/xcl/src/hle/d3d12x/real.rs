@@ -5133,6 +5133,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    // the targets these lists use are recent (the page budget's least-recently-used order)
+    super::vram::submitting(&mapped);
     let (mut t_submit, mut t_readback, mut t_cpu_writes) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
     let t1 = std::time::Instant::now();
     super::list_x::execute_with_waits(&mapped, |chunk| {
