@@ -324,6 +324,8 @@ pub fn counts() -> (usize, u64) {
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+    // (a new texture object, or the address of an old one again: its first upload is not left out)
+    LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -495,6 +497,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -780,6 +783,41 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
+/// texture → `content_hash` of its memory at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+fn unchanged_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
+/// content from here on (the caller uploads it when this is false).
+fn same_as_last_upload(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; not for anything adversarial).
+fn content_hash(b: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let mut chunks = b.chunks_exact(32);
+    for c in &mut chunks {
+        for (k, lane) in h.iter_mut().enumerate() {
+            let v = u64::from_le_bytes(c[k * 8..k * 8 + 8].try_into().unwrap());
+            *lane = (*lane ^ v).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut tail = b.len() as u64;
+    for (k, &x) in chunks.remainder().iter().enumerate() {
+        tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
+    }
+    h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
@@ -801,6 +839,20 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            // The same bytes as at this texture's last upload: nothing to do. The write watch is
+            // per page and a title writes next to its textures (and rewrites what it wrote): a
+            // retail title's video planes and UI targets went up again for every submit, ~25 MB
+            // a presented frame where ~3 MB had changed, and the submits waited here.
+            if unchanged_skip() {
+                let h = content_hash(&read_committed(va, tex.size() as usize));
+                if same_as_last_upload(r.as_raw() as usize, h) {
+                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
+                    }
+                    continue;
+                }
+            }
             device = dev;
             bytes += tex.size() as usize;
             let subs = subresources(va, &tex);
@@ -1032,6 +1084,35 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture is left out only when its memory hashes as at its own last upload, and a
+    /// texture that was forgotten (released, or its address registered again) is uploaded again.
+    #[test]
+    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
+        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        let mut mem = vec![0u8; 3 << 20];
+        mem[5] = 1;
+        let h = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
+        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
+        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
+        // one byte anywhere, also in the tail that is not a whole 32-byte step
+        for at in [0usize, 31, 32, (3 << 20) - 1] {
+            let mut m = mem.clone();
+            m[at] ^= 0x80;
+            assert_ne!(content_hash(&m), h, "byte {at} changed");
+        }
+        mem[(3 << 20) - 1] = 9;
+        let h2 = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
+        assert!(same_as_last_upload(a, h2));
+        // the length is part of the content: a prefix of zeros is not the whole
+        assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
+        forget(a);
+        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
+        forget(a);
+        forget(b);
+    }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
