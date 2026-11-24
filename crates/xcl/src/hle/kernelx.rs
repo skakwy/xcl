@@ -257,6 +257,17 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
     (a & !0xFFF) as *mut c_void
 }
 
+/// The part of `[a, a + n)` a decommit in a sparse window takes: the 64 KiB pages wholly in it.
+fn sparse_decommit_range(a: usize, n: usize) -> (usize, usize) {
+    let g = crate::gpu::uma::GRAIN;
+    let (start, end) = (a.next_multiple_of(g), (a + n) & !(g - 1));
+    if end > start {
+        (start, end - start)
+    } else {
+        (start, 0)
+    }
+}
+
 /// The range `commit_sparse` commits for `[a, a + n)`: whole 64 KiB pages.
 fn sparse_commit_range(a: usize, n: usize) -> (usize, usize) {
     let g = crate::gpu::uma::GRAIN;
@@ -457,11 +468,21 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
                 }
             }
         };
+        // a decommit takes whole 64 KiB pages only: on the console a page partly in the range
+        // stays (GTA VI decommitted from ...9000 and went on writing just above it; its memcpy at
+        // game+0x979f5b faulted); a release takes the whole reservation
+        let (a, n) = if release { (a, n) } else { sparse_decommit_range(a, n) };
+        if !release && (a, n) != (addr as usize, size) {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_info!("VirtualFree: decommit of {:#x}+{size:#x} in a sparse window keeps the 64 KiB pages it only partly covers ({a:#x}+{n:#x} goes)", addr as usize);
+            }
+        }
         if n > 0 {
             // sparse first: under its lock, so no copy of CPU writes to video memory reads the
             // pages while they go (the submit thread's copy faulted on them)
             crate::hle::d3d12x::sparse::decommitted(a, n);
-            if mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) == 0 {
+            if mem::VirtualFree(a as *mut c_void, n, mem::MEM_DECOMMIT) == 0 {
                 return 0;
             }
         }
@@ -1928,6 +1949,14 @@ mod tests {
         assert_eq!(sparse_commit_range(0x6_c140_3000, 0x1000), (0x6_c140_0000, 0x6_c141_0000));
         assert_eq!(sparse_commit_range(0x6_c140_0000, 0x2_0000), (0x6_c140_0000, 0x6_c142_0000), "whole pages stay as they are");
         assert_eq!(sparse_commit_range(0x6_c140_0000, 0), (0x6_c140_0000, 0x6_c141_0000));
+    }
+
+    /// A decommit in a sparse window takes only the 64 KiB pages wholly in its range.
+    #[test]
+    fn a_sparse_decommit_keeps_partly_covered_64k_pages() {
+        assert_eq!(sparse_decommit_range(0x6_c30f_9000, 0x3_cf07_000), (0x6_c310_0000, 0x3_cf00_000));
+        assert_eq!(sparse_decommit_range(0x6_c300_0000, 0x2_0000), (0x6_c300_0000, 0x2_0000), "whole pages go");
+        assert_eq!(sparse_decommit_range(0x6_c300_1000, 0x1000).1, 0, "inside one page: nothing goes");
     }
 
     #[test]
