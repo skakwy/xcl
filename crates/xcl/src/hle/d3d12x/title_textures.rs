@@ -930,7 +930,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
-                let h = content_hash(&read_committed(va, tex.size() as usize));
+                let h = content_hash(&title_bytes(va, tex.size() as usize));
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -1195,18 +1195,28 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
+/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
+/// as much as the detile of a video frame), else read page run by page run.
+unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    if crate::gpu::shader::readable(at, len) {
+        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
+    } else {
+        std::borrow::Cow::Owned(read_committed(at, len))
+    }
+}
+
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = read_committed(va, tex.size() as usize);
+        let mem = title_bytes(va, tex.size() as usize);
         return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
             out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
         }
@@ -1511,6 +1521,30 @@ mod tests {
         assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
+    }
+
+    /// The title's bytes are used where they are when all of them are readable, and read with the
+    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    #[test]
+    fn title_bytes_are_used_in_place_when_all_are_readable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            for page in [0usize, 2] {
+                VirtualAlloc((base + (page << 12)) as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
+            }
+            let whole = title_bytes(base, 1 << 12);
+            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
+            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(whole.iter().all(|&b| b == 0xA0));
+            let holed = title_bytes(base, 3 << 12);
+            assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
+            assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
+            assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
