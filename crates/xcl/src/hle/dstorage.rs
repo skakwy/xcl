@@ -731,7 +731,10 @@ fn writable(p: usize, n: usize) -> bool {
     // title's gigabytes of committed memory, once per request – a retail game's 8 000 loading
     // requests spent 69 s here and 4 s reading and inflating. The pages in the working set
     // answer in one call; a region found committed and writable is not walked again for a while.
-    if resident_and_writable(p, end) || WRITABLE_REGIONS.lock().unwrap().iter().any(|r| r.0 <= p && end <= r.1 && r.2.elapsed() < REGION_TTL) {
+    // (`XCL_DS_FAST_WRITABLE=0`: walk every time, as before)
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| std::env::var("XCL_DS_FAST_WRITABLE").map_or(true, |v| v.trim() != "0"));
+    if fast && (resident_and_writable(p, end) || WRITABLE_REGIONS.lock().unwrap().iter().any(|r| r.0 <= p && end <= r.1 && r.2.elapsed() < REGION_TTL)) {
         return true;
     }
     let mut at = p;
