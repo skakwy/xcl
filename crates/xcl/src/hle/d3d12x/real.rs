@@ -517,7 +517,11 @@ pub fn init() -> Result<String, String> {
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    // (`XCL_DRED=pf`: the faulting address only – breadcrumbs mark every
+                    // command list and stalled GTA VI's first seconds too)
+                    if std::env::var("XCL_DRED").map_or(true, |v| v.trim() != "pf") {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 }
                 Err(e) => {
