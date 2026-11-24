@@ -40,6 +40,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut last_map = crate::hle::kernelx::phys_map_activity();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -48,6 +49,16 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // physical-page map calls since the last line (what a loading title waits for)
+                let m = crate::hle::kernelx::phys_map_activity();
+                let dm: Vec<u64> = m.iter().zip(last_map).map(|(a, b)| a - b).collect();
+                last_map = m;
+                if dm[0] > 0 {
+                    crate::xlog_info!(
+                        "activity (2 s): {} physical-page map calls, {} pages, {} ms in them ({} ms waiting for the page lock, {} ms mapping GPU tiles)",
+                        dm[0], dm[1], dm[2] / 1_000_000, dm[3] / 1_000_000, dm[4] / 1_000_000
+                    );
+                }
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};

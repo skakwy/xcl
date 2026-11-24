@@ -1011,7 +1011,7 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
         return false;
     }
     if u.is_sparse(home) {
-        crate::hle::d3d12x::sparse::committed(home, len);
+        timed(4, || crate::hle::d3d12x::sparse::committed(home, len));
     }
     true
 }
@@ -1162,12 +1162,33 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     1
 }
 
-pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
-    let mut g = AWAY.lock().unwrap();
-    let away = g.get_or_insert_with(Away::default);
-    let r = map_pages(away, va, n, arr);
-    give_back_homes(away);
+/// Physical-page map calls for `XCL_ACTIVITY`: calls, pages, time in them, time waiting for
+/// `AWAY`, time in the GPU tile mapping of sparse windows (all in ns).
+static MAP_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// `[calls, pages, ns in the calls, ns waiting for the lock, ns mapping GPU tiles]` so far
+pub fn phys_map_activity() -> [u64; 5] {
+    std::array::from_fn(|i| MAP_STATS[i].load(Ordering::Relaxed))
+}
+
+/// time spent in `f`, added to `MAP_STATS[slot]`
+fn timed<R>(slot: usize, f: impl FnOnce() -> R) -> R {
+    let t = std::time::Instant::now();
+    let r = f();
+    MAP_STATS[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     r
+}
+
+pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+    MAP_STATS[0].fetch_add(1, Ordering::Relaxed);
+    MAP_STATS[1].fetch_add(n as u64, Ordering::Relaxed);
+    timed(2, || {
+        let mut g = timed(3, || AWAY.lock().unwrap());
+        let away = g.get_or_insert_with(Away::default);
+        let r = map_pages(away, va, n, arr);
+        give_back_homes(away);
+        r
+    })
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
@@ -1241,7 +1262,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+            timed(4, || crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE));
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
@@ -1271,11 +1292,15 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let mut g = AWAY.lock().unwrap();
-    let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
-    give_back_homes(away);
-    ok as BOOL
+    MAP_STATS[0].fetch_add(1, Ordering::Relaxed);
+    MAP_STATS[1].fetch_add(n as u64, Ordering::Relaxed);
+    timed(2, || {
+        let mut g = timed(3, || AWAY.lock().unwrap());
+        let away = g.get_or_insert_with(Away::default);
+        let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+        give_back_homes(away);
+        ok as BOOL
+    })
 }
 
 /// `BOOL XMemFreePhysicalPages(SIZE_T count, ULONG64* pages)`
