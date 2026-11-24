@@ -4898,6 +4898,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         return;
     }
     let t0 = std::time::Instant::now();
+    let _ = super::title_textures::take_phase_times();
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     let t_refresh = t0.elapsed();
@@ -4933,9 +4934,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         let k = N.fetch_add(1, Ordering::Relaxed) + 1;
         if k <= 40 || k.is_power_of_two() {
             let ms = |d: std::time::Duration| d.as_millis();
+            let p = super::title_textures::take_phase_times();
             crate::xlog_warn!(
-                "D3D12.X: slow ExecuteCommandLists #{k} ({n} lists): {} ms – refresh {} ms, submit {} ms, sparse readback {} ms, CPU writes {} ms, waits {} ms",
-                ms(total), ms(t_refresh), ms(t_submit), ms(t_readback), ms(t_cpu_writes), ms(t_exec.saturating_sub(t_submit + t_readback + t_cpu_writes))
+                "D3D12.X: slow ExecuteCommandLists #{k} ({n} lists): {} ms – refresh {} ms (write watch {}, sparse upload {}, target tiles {}, texture list {}, texture uploads {}), submit {} ms, sparse readback {} ms, CPU writes {} ms, waits {} ms",
+                ms(total), ms(t_refresh), p[1] / 1000, p[2] / 1000, p[3] / 1000, p[4] / 1000, p[5] / 1000, ms(t_submit), ms(t_readback), ms(t_cpu_writes), ms(t_exec.saturating_sub(t_submit + t_readback + t_cpu_writes))
             );
         }
     }

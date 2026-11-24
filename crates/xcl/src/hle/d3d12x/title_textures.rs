@@ -670,10 +670,37 @@ static PHASE_SINCE: AtomicU64 = AtomicU64::new(0);
 static PHASE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 const PHASE_NAMES: [&str; 8] = ["-", "write watch", "sparse upload", "target tile mapping", "texture list", "texture uploads", "the driver's ExecuteCommandLists", "PresentX"];
 
+thread_local! {
+    /// this thread's step running now and since when, and µs per step so far (`take_phase_times`)
+    static PHASE_TIMES: std::cell::RefCell<(usize, Option<std::time::Instant>, [u64; 8])> = const { std::cell::RefCell::new((0, None, [0; 8])) };
+}
+
+/// the step running on this thread ends now: its time is added to its slot
+fn close_phase() {
+    PHASE_TIMES.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(t) = c.1.take() {
+            let k = c.0;
+            c.2[k] += t.elapsed().as_micros() as u64;
+        }
+    });
+}
+
+/// µs this thread spent in each `refresh_once` step (`PHASE_NAMES`) since the last call
+pub(super) fn take_phase_times() -> [u64; 8] {
+    PHASE_TIMES.with(|c| std::mem::take(&mut c.borrow_mut().2))
+}
+
 pub(super) fn enter_phase(k: u64) {
     let t0 = *PHASE_T0.get_or_init(|| {
         let _ = std::thread::Builder::new().name("xcl-refresh-monitor".into()).spawn(phase_monitor);
         std::time::Instant::now()
+    });
+    close_phase();
+    PHASE_TIMES.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 = k as usize;
+        c.1 = Some(std::time::Instant::now());
     });
     PHASE_SINCE.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     PHASE.store(k, Ordering::Release);
@@ -695,6 +722,7 @@ fn phase_monitor() {
 
 /// The step `enter_phase` named is over.
 pub(super) fn leave_phase() {
+    close_phase();
     PHASE.store(0, Ordering::Release);
 }
 
@@ -702,7 +730,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     struct Done;
     impl Drop for Done {
         fn drop(&mut self) {
-            PHASE.store(0, Ordering::Release);
+            leave_phase();
         }
     }
     let _done = Done;
