@@ -854,6 +854,21 @@ impl State {
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+            // what the queue may be held by: the readbacks it waits for (a title queue's signal)
+            // and the GPU waits armed on title queues
+            let done = self.rb_fence.GetCompletedValue();
+            let pending: Vec<String> = RB_WAITS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|w| w.0 > done)
+                .map(|w| format!("#{} from q{} {:.1} s ago", w.0, super::list_x::queue_label(w.1), w.2.elapsed().as_secs_f32()))
+                .collect();
+            crate::xlog_warn!(
+                "sparse: readbacks done to #{done}, waiting for [{}]; armed GPU waits: [{}]",
+                pending.join(", "),
+                super::list_x::armed_summary()
+            );
         }
     }
 
@@ -1259,6 +1274,17 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
 }
 
+/// The last readbacks the sparse queue was told to wait for: (rb fence value, title queue, when).
+static RB_WAITS: Mutex<std::collections::VecDeque<(u64, usize, std::time::Instant)>> = Mutex::new(std::collections::VecDeque::new());
+
+fn note_rb_wait(v: u64, queue: usize) {
+    let mut g = RB_WAITS.lock().unwrap();
+    g.push_back((v, queue, std::time::Instant::now()));
+    while g.len() > 32 {
+        g.pop_front();
+    }
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
@@ -1283,6 +1309,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
+        note_rb_wait(v, queue.as_raw() as usize);
         let _ = s.queue.Wait(&s.rb_fence, v);
     }
     s.readback_ranges(&merged);

@@ -1089,6 +1089,29 @@ static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// For a stall report: the GPU waits armed on title queues and not seen complete (queue id,
+/// address, value, seconds armed), the oldest first. Empty if the graph is busy.
+pub(super) fn armed_summary() -> String {
+    let Ok(g) = SYNC_GRAPH.try_lock() else { return "graph busy".into() };
+    let Some(gr) = g.as_ref() else { return "none".into() };
+    let mut v: Vec<(f32, usize, u64, u64)> = gr
+        .cells
+        .iter()
+        .flat_map(|(&va, c)| c.armed_waits.iter().map(move |a| (a.armed_at.elapsed().as_secs_f32(), a.waiting_queue, va, a.val)))
+        .collect();
+    v.sort_by(|a, b| b.0.total_cmp(&a.0));
+    v.truncate(8);
+    if v.is_empty() {
+        return "none".into();
+    }
+    v.iter().map(|&(t, q, va, val)| format!("q{} at {va:#x} >= {val:#x} for {t:.1} s", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
+/// The short id title queues have in the sync log lines.
+pub(super) fn queue_label(q: usize) -> usize {
+    queue_id(q)
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
