@@ -949,6 +949,13 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!(
+                    "DirectStorage: destination pages not resolved: {}",
+                    pages.iter().map(|&x| crate::hle::kernelx::describe_page(x)).collect::<Vec<_>>().join("; ")
+                );
+            }
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {

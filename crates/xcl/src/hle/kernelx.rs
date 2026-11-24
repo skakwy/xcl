@@ -956,7 +956,12 @@ pub fn describe_home(va: usize) -> Option<String> {
 /// For a log line: what XCL knows of physical page `page` (its number, home, where it is mapped).
 pub fn describe_page(page: usize) -> String {
     let away = AWAY.try_lock().ok().and_then(|g| g.as_ref().and_then(|a| a.page.get(&page).copied()));
-    format!("page {page:#x}: index {:?}, home {:?}, away at {away:x?}", page_index(page), page_home(page).map(|h| format!("{h:#x}")))
+    let block = page_index(page).and_then(|i| {
+        let blocks = PHYS_BLOCKS.try_lock().ok()?;
+        let (&first, b) = blocks.range(..=i).next_back()?;
+        Some(format!("block from index {first} of {} pages ({} live), offset {} {}", b.count, b.live, i - first, if i - first < b.count { if b.is_live(i - first) { "live" } else { "freed" } } else { "past the block" }))
+    });
+    format!("page {page:#x}: index {:?}, home {:?}, away at {away:x?}, {}", page_index(page), page_home(page).map(|h| format!("{h:#x}")), block.unwrap_or_else(|| "no block".into()))
 }
 
 fn page_index(page: usize) -> Option<usize> {
