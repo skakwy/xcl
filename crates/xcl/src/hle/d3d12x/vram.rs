@@ -272,6 +272,7 @@ struct Target {
 
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
+    device: ID3D12Device,
     queue: ID3D12CommandQueue,
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
@@ -293,6 +294,8 @@ struct Pages {
     waited: std::collections::HashMap<usize, u64>,
     /// page budget: no eviction round before this (`EVICT_RETRY`)
     evict_after: Option<std::time::Instant>,
+    /// title queue → a fence signalled after its submitted work, used to order unmaps
+    queue_fences: std::collections::HashMap<usize, (ID3D12Fence, u64)>,
 }
 
 // D3D12 objects are free-threaded
@@ -314,6 +317,7 @@ impl Pages {
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
+            device: dev.clone(),
             queue,
             fence,
             value: 0,
@@ -326,6 +330,7 @@ impl Pages {
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
             evict_after: None,
+            queue_fences: std::collections::HashMap::new(),
         })
     }
 
@@ -436,7 +441,34 @@ impl Pages {
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
     /// to the pool even while the title keeps the COM object alive.
-    unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+    unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) -> bool {
+        // Every title queue is conservatively included: a draw already submitted there may
+        // still sample this resource. Queue waits keep this asynchronous; the mapping queue
+        // performs the unmap only after the title queues reach these markers.
+        for raw in super::present::known_queues() {
+            let raw_ptr = raw as *mut c_void;
+            let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&raw_ptr) else { continue };
+            if !self.queue_fences.contains_key(&raw) {
+                let Ok(fence) = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) else {
+                    crate::xlog_warn!("D3D12.X: could not create texture-use fence; keeping mapping");
+                    return false;
+                };
+                self.queue_fences.insert(raw, (fence, 0));
+            }
+            let (fence, value) = {
+                let (fence, value) = self.queue_fences.get_mut(&raw).unwrap();
+                *value += 1;
+                (fence.clone(), *value)
+            };
+            if let Err(e) = queue.Signal(&fence, value) {
+                crate::xlog_warn!("D3D12.X: could not fence texture use before unmap: {e}");
+                return false;
+            }
+            if let Err(e) = self.queue.Wait(&fence, value) {
+                crate::xlog_warn!("D3D12.X: could not order texture unmap after title work: {e}");
+                return false;
+            }
+        }
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
@@ -454,6 +486,7 @@ impl Pages {
         );
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        true
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -517,15 +550,18 @@ impl Pages {
                 break;
             }
             for key in keys {
+                let Some(total) = self.targets.get(&key).map(|t| t.total) else { continue };
+                let raw = key as *mut c_void;
+                // (the unmap waits on the GPU for the title queues' work so far; when that cannot
+                // be ordered the texture stays mapped)
+                let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
+                if !self.unmap(res, total) {
+                    continue;
+                }
                 let Some(t) = self.targets.get_mut(&key) else { continue };
-                let total = t.total;
                 let used = std::mem::take(&mut t.used);
                 let used_extra = std::mem::take(&mut t.used_extra);
                 t.mapped = false;
-                let raw = key as *mut c_void;
-                if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
-                    self.unmap(res, total);
-                }
                 self.release_tiles(used, used_extra, now, true);
                 evicted.push(key);
             }
@@ -712,15 +748,17 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.get_mut(&key) else { continue };
-        if !t.mapped {
+        let Some((total, mapped)) = pages.targets.get(&key).map(|t| (t.total, t.mapped)) else { continue };
+        if !mapped {
             return;
         }
-        let total = t.total;
+        if !pages.unmap(res, total) {
+            return;
+        }
+        let Some(t) = pages.targets.get_mut(&key) else { return };
         let used = std::mem::take(&mut t.used);
         let used_extra = std::mem::take(&mut t.used_extra);
         t.mapped = false;
-        pages.unmap(res, total);
         pages.release_tiles(used, used_extra, now, true);
         return;
     }
@@ -1191,6 +1229,104 @@ mod tests {
         let early = *bytes[20..120].iter().max().unwrap();
         let late = *bytes[300..].iter().max().unwrap();
         assert!(late <= early, "arenas grow over time: {early} then {late} bytes");
+    }
+
+    /// A title queue held behind a fence must keep a superseded texture mapped until its queued
+    /// work passes the queue marker. The mapping queue must then complete the unmap afterwards.
+    #[test]
+    fn superseded_texture_unmap_waits_for_title_queue_work() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let Ok(adapter) = factory.EnumAdapters1(0) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut raw = std::ptr::null_mut();
+            let hr = place(dev.as_raw(), 0x6A00_0000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(64 * 64 * 4), riid, &mut raw);
+            if hr.is_none_or(|hr| hr < 0) || raw.is_null() {
+                crate::gpu::recomp::runner::skip_test("reserved texture unavailable");
+                return;
+            }
+            let resource = ID3D12Resource::from_raw(raw);
+            if !is_placed_texture(raw as usize) {
+                drop(resource);
+                forget(raw as usize);
+                crate::gpu::recomp::runner::skip_test("reserved texture unavailable");
+                return;
+            }
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let transition = D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: std::mem::transmute_copy(&resource),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: D3D12_RESOURCE_STATE_COMMON,
+                StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            };
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(transition) },
+                ..Default::default()
+            }]);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            unmap_superseded(&resource);
+            let key = dev.as_raw() as usize;
+            let g = PAGES.lock().unwrap();
+            let pages = g.get(&key).and_then(Option::as_ref).unwrap();
+            let unmap_value = pages.value;
+            assert!(!pages.targets[&(raw as usize)].mapped);
+            let deadline = std::time::Instant::now() + Duration::from_millis(100);
+            while pages.fence.GetCompletedValue() < unmap_value && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(pages.fence.GetCompletedValue() < unmap_value, "unmap completed before the title queue marker");
+            drop(g);
+
+            gate.Signal(1).unwrap();
+            let g = PAGES.lock().unwrap();
+            let pages = g.get(&key).and_then(Option::as_ref).unwrap();
+            pages.fence.SetEventOnCompletion(unmap_value, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            assert!(pages.fence.GetCompletedValue() >= unmap_value, "unmap did not complete after title queue work");
+            drop(g);
+            drop(resource);
+            forget(raw as usize);
+        }
     }
 
     /// On the GPU: D32S8 targets 256 MiB apart take their own size of video memory, not an arena

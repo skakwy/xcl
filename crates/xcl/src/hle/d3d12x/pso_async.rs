@@ -568,6 +568,7 @@ mod tests {
                 let _ = rx.recv_timeout(Duration::from_secs(5));
                 real_pso
             }),
+            0,
         );
 
         // First call sends the lazy build to the compute worker pool and returns the stand-in after ~limit.
@@ -606,6 +607,7 @@ mod tests {
                 let _ = name_tx.send(std::thread::current().name().unwrap_or("").to_string());
                 real_pso
             }),
+            0,
         );
         assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(4)), &budget), real_pso);
         let worker_name = name_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -632,6 +634,7 @@ mod tests {
                 let _ = rx_a.recv_timeout(Duration::from_secs(5));
                 real_a
             }),
+            0,
         );
         submit_lazy(
             standin_b,
@@ -640,6 +643,7 @@ mod tests {
                 let _ = rx_b.recv_timeout(Duration::from_secs(5));
                 real_b
             }),
+            0,
         );
 
         // First slow pipeline consumes the entire 60 ms frame budget.

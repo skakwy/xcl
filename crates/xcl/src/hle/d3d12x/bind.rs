@@ -1176,6 +1176,7 @@ mod tests {
                 real::register_translated_compute_for_test(real_pending);
                 real_pending
             }),
+            0,
         );
         assert_eq!(
             pso_async::resolve_compute_with_limit_for_test(standin_pending, std::time::Duration::from_millis(20)),
