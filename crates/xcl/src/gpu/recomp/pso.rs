@@ -105,11 +105,13 @@ pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
 
 /// Whether translated shaders reach the memory windows through the shared descriptor heap
 /// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
-/// instead of a `switch` over root UAVs. On unless `XCL_HEAP_WINDOWS=0` or the views could not
-/// be made (no shared heap: then the switch, as before).
+/// instead of a `switch` over root UAVs. Opt-in: on with `XCL_HEAP_WINDOWS=1`, unless the views
+/// could not be made (no shared heap: then the switch, as before). Off by default: two NVIDIA
+/// setups failed with it (the driver's compiler ending the process; a device removal when the
+/// views are made on an 8 GB card) that other machines do not show.
 pub fn heap_windows() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").map_or(true, |v| v != "0")) && !crate::hle::d3d12x::console_heap::window_views_failed()
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.

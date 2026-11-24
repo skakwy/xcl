@@ -43,8 +43,20 @@ thread_local! {
 }
 
 fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_HOLD_SUBMITS").map_or(true, |v| v.trim() != "0"))
+    // (unit tests: only on the threads of the tests of this module – other tests' fake queues
+    // must not be held and then submitted by the release thread)
+    #[cfg(test)]
+    return TEST_ON.with(|t| t.get());
+    #[allow(unreachable_code)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XCL_HOLD_SUBMITS").map_or(true, |v| v.trim() != "0"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn releasing() -> bool {
@@ -259,6 +271,7 @@ mod tests {
     /// Operations on a queue that holds something are kept in order; another queue's are not.
     #[test]
     fn a_queue_with_something_held_keeps_its_later_operations_in_order() {
+        TEST_ON.with(|t| t.set(true));
         let (a, b) = (0x5100_0001usize, 0x5100_0002usize);
         push(a, Op::Execute { lists: vec![1], pc: vec![2], wait: Some((0x1000, 5)), since: Instant::now() });
         assert!(queue_held(a));

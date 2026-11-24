@@ -25,15 +25,84 @@ struct Pending {
     key: u64,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
-    /// a bounded compute wait already timed out; subsequent binds skip waiting until `real` lands
-    timed_out: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
+    demand: Mutex<Demand>,
+}
+
+/// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
+#[derive(Default)]
+struct Demand {
+    wanted: bool,
+    /// thread id of the preload worker (lowest priority) building it, 0 = none
+    preload_thread: u32,
+}
+
+thread_local! {
+    /// what this worker is building
+    static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread is a worker and one of the title's threads waits for what it is building: the
+/// build must not stand back for the title's sake (`real::big_compile_turn`).
+pub(super) fn build_is_wanted() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+}
+
+/// Whether one of the title's threads waits for what this thread is doing, to be asked later and
+/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
+/// title's own.
+pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        return Box::new(move || p.demand.lock().unwrap().wanted);
+    }
+    let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
+    Box::new(move || own)
+}
+
+/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
+fn build(p: &Arc<Pending>, job: Job, preload: bool) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    if preload {
+        let mut d = p.demand.lock().unwrap();
+        d.preload_thread = unsafe { GetCurrentThreadId() };
+        if d.wanted {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+        }
+    }
+    complete(p, job());
+    if preload {
+        // (under the lock: `want` does not raise this thread after it)
+        let mut d = p.demand.lock().unwrap();
+        d.preload_thread = 0;
+        if d.wanted {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+        }
+    }
+    BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
 impl Pending {
+    /// One of the title's threads is about to wait for it: the worker building it goes on now,
+    /// at a normal priority.
+    fn want(&self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
+        let mut d = self.demand.lock().unwrap();
+        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+            unsafe {
+                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
+                if !h.is_null() {
+                    SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+                    CloseHandle(h);
+                }
+            }
+        }
+    }
+
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
@@ -76,48 +145,27 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn spawn_pool(prefix: &str, threads: usize) -> Mutex<mpsc::Sender<Arc<Pending>>> {
-    let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-    let rx = Arc::new(Mutex::new(rx));
-    // translation recurses deeply on big programs; DXC itself runs on its own pool
-    for k in 0..threads {
-        let rx = rx.clone();
-        let _ = std::thread::Builder::new().name(format!("{prefix}-{k}")).stack_size(64 << 20).spawn(move || loop {
-            let next = rx.lock().unwrap().recv();
-            let Ok(p) = next else { return };
-            // (None: a bind took it and builds it itself)
-            let job = p.job.lock().unwrap().take();
-            if let Some(job) = job {
-                complete(&p, job());
-            }
-        });
-    }
-    Mutex::new(tx)
-}
-
 fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| spawn_pool("xcl-pso", crate::gpu::recomp::dxc::compile_threads()))
-}
-
-/// Dedicated worker pool for compute pipelines so a backlog (or driver stall, #156) of graphics
-/// builds cannot starve compute dispatches indefinitely.
-fn compute_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| spawn_pool("xcl-pso-compute", (crate::gpu::recomp::dxc::compile_threads() / 2).clamp(1, 4)))
-}
-
-/// Send `p` to its worker pool if not already sent; clears `sent` on failure so a later bind
-/// can retry instead of stalling forever.
-fn enqueue(p: &Arc<Pending>) -> bool {
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        let q = if p.compute { compute_queue() } else { queue() };
-        if q.lock().unwrap().send(p.clone()).is_err() {
-            p.sent.store(false, Ordering::Release);
-            return false;
+    Q.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let rx = Arc::new(Mutex::new(rx));
+        // translation recurses deeply on big programs; DXC itself runs on its own pool
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        for k in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+                let next = rx.lock().unwrap().recv();
+                let Ok(p) = next else { return };
+                // (None: a bind took it and builds it itself)
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    build(&p, job, false);
+                }
+            });
         }
-    }
-    true
+        Mutex::new(tx)
+    })
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -151,16 +199,16 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(false),
+        sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
         key,
         used: Default::default(),
-        timed_out: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
+        demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -168,7 +216,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = enqueue(&p);
+        let _ = queue().lock().unwrap().send(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -297,8 +345,7 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
-                        let real = job();
-                        complete(&p, real);
+                        build(&p, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
@@ -336,6 +383,49 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
+        let _ = released(standin);
+    }
+
+    /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
+    /// another thread, as the DXC workers do; a thread that builds nothing (no title runs here)
+    /// wants nothing.
+    #[test]
+    fn a_waiting_bind_makes_the_builds_compiles_wanted() {
+        let standin = 0x7E57_B005usize;
+        let (tx, rx) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            tx.send(wanted_here()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0x5454
+        }));
+        let wanted = rx.recv().unwrap();
+        assert!(!wanted(), "nobody waits yet");
+        assert_eq!(resolve_wait_for(standin, None), 0x5454);
+        assert!(wanted());
+        assert!(!wanted_here()());
+        let _ = released(standin);
+    }
+
+    /// A worker's build hears that a bind waits for it (and only its own build does).
+    #[test]
+    fn a_waiting_bind_makes_the_build_wanted() {
+        let standin = 0x7E57_B004usize;
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            let unwanted_first = !build_is_wanted();
+            started_tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if unwanted_first && build_is_wanted() { 0x5353 } else { 0 }
+        }));
+        started.recv().unwrap();
+        assert!(!build_is_wanted(), "this thread builds nothing");
+        assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
         let _ = released(standin);
     }
 
@@ -381,7 +471,9 @@ pub fn resolve(pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
-            let _ = enqueue(&p);
+            if !p.sent.swap(true, Ordering::AcqRel) {
+                let _ = queue().lock().unwrap().send(p);
+            }
             pso
         }
         r => r,
@@ -405,6 +497,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(job) = job {
         complete(&p, job());
     }
+    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -414,124 +507,6 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         r => r,
     }
 }
-
-/// Maximum per-frame time title threads wait for uncached compute pipelines on first
-/// bind/dispatch (`XCL_COMPUTE_PSO_WAIT_MS`, default 4000 ms; `0` = unbounded). Huge compute
-/// shaders can take 20+ s to compile in DXC / the driver, and a loading frame can bind many
-/// uncached compute pipelines in a row; sharing one budget per frame keeps the total bounded.
-fn compute_wait_timeout() -> Option<std::time::Duration> {
-    static LIMIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let ms = std::env::var("XCL_COMPUTE_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4000);
-        if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) }
-    })
-}
-
-/// Shared per-frame compute wait budget, reset at each `PresentX` boundary (`reset_frame_budget`).
-struct FrameBudget {
-    spent_ms: std::sync::atomic::AtomicU64,
-}
-
-impl FrameBudget {
-    const fn new() -> Self {
-        Self { spent_ms: std::sync::atomic::AtomicU64::new(0) }
-    }
-
-    fn remaining(&self, limit: std::time::Duration) -> std::time::Duration {
-        let limit_ms = limit.as_millis().min(u64::MAX as u128) as u64;
-        let spent = self.spent_ms.load(Ordering::Relaxed);
-        std::time::Duration::from_millis(limit_ms.saturating_sub(spent))
-    }
-
-    fn consume(&self, elapsed: std::time::Duration) {
-        let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
-        if ms > 0 {
-            self.spent_ms.fetch_add(ms, Ordering::Relaxed);
-        }
-    }
-
-    fn reset(&self) {
-        self.spent_ms.store(0, Ordering::Relaxed);
-    }
-}
-
-static FRAME_BUDGET: FrameBudget = FrameBudget::new();
-
-/// Reset the per-frame compute pipeline wait budget (called at `PresentX`).
-pub fn reset_frame_budget() {
-    FRAME_BUDGET.reset();
-}
-
-/// Bounded wait for a compute pipeline: always builds on `xcl-pso-compute-*` workers (never
-/// stalling the title's thread inside DXC/driver), waits at most the remaining per-frame `budget`
-/// up to `limit`, and returns the stand-in immediately once timed out or once the frame budget is
-/// exhausted until the worker finishes.
-fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget) -> usize {
-    let Some(limit) = limit else {
-        return resolve_wait(pso);
-    };
-    let Some(p) = entry(pso) else { return pso };
-    if let r @ 1.. = p.real.load(Ordering::Acquire) {
-        return r;
-    }
-    if !enqueue(&p) {
-        return pso;
-    }
-    if p.timed_out.load(Ordering::Acquire) {
-        return match p.real.load(Ordering::Acquire) {
-            0 => pso,
-            r => r,
-        };
-    }
-    let rem_budget = budget.remaining(limit);
-    if rem_budget.is_zero() {
-        return match p.real.load(Ordering::Acquire) {
-            0 => pso,
-            r => r,
-        };
-    }
-    let started = std::time::Instant::now();
-    let deadline = started + rem_budget;
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        let rem = deadline.saturating_duration_since(std::time::Instant::now());
-        if rem.is_zero() {
-            break;
-        }
-        let (g, res) = p.cv.wait_timeout(done, rem).unwrap();
-        done = g;
-        if res.timed_out() {
-            break;
-        }
-    }
-    let elapsed = started.elapsed();
-    if !*done {
-        budget.consume(elapsed.max(rem_budget));
-        if rem_budget >= limit / 2 && !p.timed_out.swap(true, Ordering::AcqRel) {
-            static LOGGED: AtomicUsize = AtomicUsize::new(0);
-            if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
-                crate::xlog_warn!(
-                    "D3D12.X: compute pipeline {pso:#x} still building after {} ms – proceeding with stand-in (continues in background)",
-                    elapsed.as_millis()
-                );
-            }
-        }
-        return pso;
-    }
-    budget.consume(elapsed);
-    match p.real.load(Ordering::Acquire) {
-        0 => pso,
-        r => r,
-    }
-}
-
-/// Resolve a compute pipeline with `XCL_COMPUTE_PSO_WAIT_MS` per-frame bounding.
-pub fn resolve_compute(pso: usize) -> usize {
-    resolve_compute_within(pso, compute_wait_timeout(), &FRAME_BUDGET)
-}
-
-/// For binding: compute pipelines wait up to `XCL_COMPUTE_PSO_WAIT_MS` on background workers;
-/// graphics pipelines are queued without blocking.
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
 /// it is built). A retail game builds compute programs on its own threads: the driver takes up to
@@ -559,6 +534,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
+    p.want();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
     if *done {
         return built(p);
@@ -576,17 +552,8 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_compute(pso),
+        Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
-        None => pso,
-    }
-}
-
-/// For `ExecuteIndirect`: compute pipelines use bounded waits, graphics pipelines keep `resolve_wait`.
-pub fn resolve_for_indirect(pso: usize) -> usize {
-    match entry(pso) {
-        Some(p) if p.compute => resolve_compute(pso),
-        Some(_) => resolve_wait(pso),
         None => pso,
     }
 }
@@ -611,141 +578,8 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
-/// `pso` is a compute stand-in whose real pipeline is still being built.
-pub fn is_pending_compute(pso: usize) -> bool {
-    entry(pso).is_some_and(|p| p.compute && !*p.done.lock().unwrap())
-}
-
-#[cfg(test)]
-pub(crate) fn resolve_compute_with_limit_for_test(pso: usize, limit: std::time::Duration) -> usize {
-    resolve_compute_within(pso, Some(limit), &FrameBudget::new())
-}
-
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn bounded_compute_wait_times_out_then_resolves_once_worker_finishes() {
-        let standin = 0x7300_0001usize;
-        let real_pso = 0x7300_0002usize;
-        let budget = FrameBudget::new();
-        let (tx, rx) = mpsc::channel::<()>();
-        submit_lazy(
-            standin,
-            true,
-            Box::new(move || {
-                let _ = rx.recv_timeout(Duration::from_secs(5));
-                real_pso
-            }),
-            0,
-        );
-
-        // First call sends the lazy build to the compute worker pool and returns the stand-in after ~limit.
-        let t0 = Instant::now();
-        assert_eq!(resolve_compute_within(standin, Some(Duration::from_millis(60)), &budget), standin);
-        assert!(t0.elapsed() < Duration::from_secs(1), "bounded wait must not block indefinitely");
-        assert!(is_pending_compute(standin));
-
-        // Subsequent calls while still building return immediately (even on a fresh frame budget).
-        budget.reset();
-        let t1 = Instant::now();
-        assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(2)), &budget), standin);
-        assert!(t1.elapsed() < Duration::from_millis(200), "post-timeout calls must return immediately");
-
-        // Unblock the background worker; once complete, resolution immediately returns the real PSO.
-        tx.send(()).unwrap();
-        let wait = Instant::now();
-        while resolve_compute_within(standin, Some(Duration::from_millis(50)), &budget) != real_pso {
-            assert!(wait.elapsed() < Duration::from_secs(5), "background compute PSO never completed");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!is_pending_compute(standin));
-        assert_eq!(released(standin), real_pso);
-    }
-
-    #[test]
-    fn bounded_compute_wait_returns_real_when_build_finishes_in_time() {
-        let standin = 0x7300_0003usize;
-        let real_pso = 0x7300_0004usize;
-        let budget = FrameBudget::new();
-        let (name_tx, name_rx) = mpsc::channel::<String>();
-        submit_lazy(
-            standin,
-            true,
-            Box::new(move || {
-                let _ = name_tx.send(std::thread::current().name().unwrap_or("").to_string());
-                real_pso
-            }),
-            0,
-        );
-        assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(4)), &budget), real_pso);
-        let worker_name = name_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(
-            worker_name.starts_with("xcl-pso-compute-"),
-            "compute pipelines must run on dedicated compute workers, got {worker_name:?}"
-        );
-        assert_eq!(released(standin), real_pso);
-    }
-
-    #[test]
-    fn bounded_compute_wait_shares_per_frame_budget_across_pipelines() {
-        let standin_a = 0x7300_0005usize;
-        let real_a = 0x7300_0006usize;
-        let standin_b = 0x7300_0007usize;
-        let real_b = 0x7300_0008usize;
-        let budget = FrameBudget::new();
-        let (tx_a, rx_a) = mpsc::channel::<()>();
-        let (tx_b, rx_b) = mpsc::channel::<()>();
-        submit_lazy(
-            standin_a,
-            true,
-            Box::new(move || {
-                let _ = rx_a.recv_timeout(Duration::from_secs(5));
-                real_a
-            }),
-            0,
-        );
-        submit_lazy(
-            standin_b,
-            true,
-            Box::new(move || {
-                let _ = rx_b.recv_timeout(Duration::from_secs(5));
-                real_b
-            }),
-            0,
-        );
-
-        // First slow pipeline consumes the entire 60 ms frame budget.
-        assert_eq!(resolve_compute_within(standin_a, Some(Duration::from_millis(60)), &budget), standin_a);
-
-        // Second uncached pipeline in the same frame is queued but does NOT stall for another 60 ms.
-        let t_b = Instant::now();
-        assert_eq!(resolve_compute_within(standin_b, Some(Duration::from_millis(60)), &budget), standin_b);
-        assert!(
-            t_b.elapsed() < Duration::from_millis(20),
-            "second pipeline in exhausted frame must not multiply wait time"
-        );
-
-        // Next frame refreshes the budget; once `b` finishes, waiting on it resolves `real_b`.
-        budget.reset();
-        tx_b.send(()).unwrap();
-        assert_eq!(resolve_compute_within(standin_b, Some(Duration::from_secs(4)), &budget), real_b);
-
-        tx_a.send(()).unwrap();
-        let wait = Instant::now();
-        while resolve_compute_within(standin_a, Some(Duration::from_millis(50)), &budget) != real_a {
-            assert!(wait.elapsed() < Duration::from_secs(5), "background compute PSO A never completed");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(released(standin_a), real_a);
-        assert_eq!(released(standin_b), real_b);
-    }
 }
