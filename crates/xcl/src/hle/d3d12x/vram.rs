@@ -169,6 +169,9 @@ const COOL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Page budget (`XCL_PAGE_BUDGET_MB`): a texture the CPU fills is not evicted before this
 /// long after it was placed, remapped or used in a transition.
 const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Page budget: when a round at `EVICT_MIN_AGE` frees too little, the textures unused this long
+/// go too (they are uploaded again from the title's memory when it uses them).
+const EVICT_MIN_AGE_TIGHT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Page budget: textures smaller than this are never evicted (UI, fonts, small lookups).
 const EVICT_MIN_TILES: u32 = 4;
 /// Page budget: tiles freed per eviction round once the pools are at the budget.
@@ -343,7 +346,10 @@ impl Pages {
             let now = std::time::Instant::now();
             if self.evict_after.is_none_or(|t| now >= t) {
                 let before = self.free.len() + self.cooling.len();
-                self.evict_lru(EVICT_BATCH);
+                self.evict_lru(EVICT_BATCH, EVICT_MIN_AGE);
+                if self.free.len() + self.cooling.len() - before < EVICT_BATCH / 4 {
+                    self.evict_lru(EVICT_BATCH, EVICT_MIN_AGE_TIGHT);
+                }
                 self.evict_after = (self.free.len() + self.cooling.len() - before < EVICT_BATCH / 4).then(|| now + EVICT_RETRY);
             }
             if let Some(t) = self.free.pop() {
@@ -485,32 +491,44 @@ impl Pages {
 
     /// Page budget: unmap CPU-filled textures, least recently touched first, until `want`
     /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
-    unsafe fn evict_lru(&mut self, want: usize) {
+    unsafe fn evict_lru(&mut self, want: usize, min_age: std::time::Duration) {
         let now = std::time::Instant::now();
         let before = self.free.len() + self.cooling.len();
-        let mut order: Vec<(std::time::Instant, usize)> = self
-            .targets
-            .iter()
-            .filter(|(_, t)| t.evictable && t.mapped && t.total >= EVICT_MIN_TILES && now.duration_since(t.touched) >= EVICT_MIN_AGE)
-            .map(|(&k, t)| (t.touched, k))
-            .collect();
-        order.sort_unstable();
+        // the textures at one address share its pages (a title makes many views of the same
+        // memory): they go together or not at all – one alone gave nothing back. A group with a
+        // texture the GPU fills stays (its pages stay with it).
+        let mut groups: std::collections::HashMap<usize, (std::time::Instant, u32, bool, Vec<usize>)> = std::collections::HashMap::new();
+        for (&k, t) in &self.targets {
+            if !t.mapped {
+                continue;
+            }
+            let g = groups.entry(t.va).or_insert((t.touched, 0, false, Vec::new()));
+            g.0 = g.0.max(t.touched);
+            g.1 += t.total;
+            g.2 |= !t.evictable;
+            g.3.push(k);
+        }
+        let mut order: Vec<(std::time::Instant, Vec<usize>)> =
+            groups.into_values().filter(|g| !g.2 && g.1 >= EVICT_MIN_TILES && now.duration_since(g.0) >= min_age).map(|g| (g.0, g.3)).collect();
+        order.sort_unstable_by_key(|g| g.0);
         let mut evicted = Vec::new();
-        for (_, key) in order {
+        for (_, keys) in order {
             if self.free.len() + self.cooling.len() - before >= want {
                 break;
             }
-            let Some(t) = self.targets.get_mut(&key) else { continue };
-            let total = t.total;
-            let used = std::mem::take(&mut t.used);
-            let used_extra = std::mem::take(&mut t.used_extra);
-            t.mapped = false;
-            let raw = key as *mut c_void;
-            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
-                self.unmap(res, total);
+            for key in keys {
+                let Some(t) = self.targets.get_mut(&key) else { continue };
+                let total = t.total;
+                let used = std::mem::take(&mut t.used);
+                let used_extra = std::mem::take(&mut t.used_extra);
+                t.mapped = false;
+                let raw = key as *mut c_void;
+                if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                    self.unmap(res, total);
+                }
+                self.release_tiles(used, used_extra, now, true);
+                evicted.push(key);
             }
-            self.release_tiles(used, used_extra, now, true);
-            evicted.push(key);
         }
         if !evicted.is_empty() {
             let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
@@ -1306,7 +1324,7 @@ mod tests {
                 }
                 Some(ID3D12Resource::from_raw(p))
             };
-            let (Some(old), Some(newer), Some(written)) = (place_at(0x60_0000_0000), place_at(0x60_1000_0000), place_at(0x60_2000_0000)) else {
+            let (Some(old), Some(twin), Some(newer), Some(written)) = (place_at(0x60_0000_0000), place_at(0x60_0000_0000), place_at(0x60_1000_0000), place_at(0x60_2000_0000)) else {
                 crate::gpu::recomp::runner::skip_test("no reserved textures");
                 return;
             };
@@ -1317,12 +1335,13 @@ mod tests {
             {
                 let mut g = PAGES.lock().unwrap();
                 let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
-                for (r, age) in [(&old, 30), (&newer, 20), (&written, 40)] {
+                for (r, age) in [(&old, 30), (&twin, 25), (&newer, 20), (&written, 40)] {
                     pages.targets.get_mut(&key(r)).unwrap().touched = now - Duration::from_secs(age);
                 }
                 let used_before = pages.pages.len();
-                pages.evict_lru(1);
+                pages.evict_lru(1, EVICT_MIN_AGE);
                 assert!(!pages.targets[&key(&old)].mapped, "the oldest CPU-filled texture is evicted");
+                assert!(!pages.targets[&key(&twin)].mapped, "with the other texture at its address (they share its pages)");
                 assert!(pages.targets[&key(&newer)].mapped, "one is enough for one tile");
                 assert!(pages.targets[&key(&written)].mapped, "a GPU-written texture is never evicted");
                 assert!(pages.pages.len() < used_before, "its pages went back");
@@ -1331,7 +1350,7 @@ mod tests {
             assert!(!take_evicted(key(&old)), "true once");
             assert!(remap_if_unmapped(&old));
             assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
-            drop((old, newer, written));
+            drop((old, twin, newer, written));
         }
     }
 }
