@@ -243,11 +243,24 @@ const PAGE_GPU_X: u32 = 0x2_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
-    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
-    if !q.is_null() {
-        crate::hle::d3d12x::sparse::committed(q as usize, n);
+    // the title's memory in the windows is of the console's 64 KiB pages (its reservations there
+    // are whole ones): a commit that ends inside a page has all of it on the console, and a title
+    // writes past its last 4 KiB into the rest (GTA VI's memcpy at game+0x979f5b faulted on a
+    // reserved page just past a commit ending at ...9000)
+    let (start, end) = sparse_commit_range(a, n);
+    let q = mem::VirtualAlloc(start as *const c_void, end - start, mem::MEM_COMMIT, sanitize_protect(p));
+    if q.is_null() {
+        return q;
     }
-    q
+    crate::hle::d3d12x::sparse::committed(start, end - start);
+    // (what Windows returns for the request: its first 4 KiB page)
+    (a & !0xFFF) as *mut c_void
+}
+
+/// The range `commit_sparse` commits for `[a, a + n)`: whole 64 KiB pages.
+fn sparse_commit_range(a: usize, n: usize) -> (usize, usize) {
+    let g = crate::gpu::uma::GRAIN;
+    (a & !(g - 1), (a + n.max(1)).next_multiple_of(g))
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
@@ -1906,6 +1919,16 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A commit in a sparse window covers whole 64 KiB pages: one ending inside a page has the
+    /// rest of it (GTA VI wrote 0xe80 bytes past a commit ending at ...489000).
+    #[test]
+    fn a_sparse_commit_covers_whole_64k_pages() {
+        assert_eq!(sparse_commit_range(0x6_c140_0000, 0x8_9000), (0x6_c140_0000, 0x6_c149_0000));
+        assert_eq!(sparse_commit_range(0x6_c140_3000, 0x1000), (0x6_c140_0000, 0x6_c141_0000));
+        assert_eq!(sparse_commit_range(0x6_c140_0000, 0x2_0000), (0x6_c140_0000, 0x6_c142_0000), "whole pages stay as they are");
+        assert_eq!(sparse_commit_range(0x6_c140_0000, 0), (0x6_c140_0000, 0x6_c141_0000));
+    }
 
     #[test]
     fn fine_timer_makes_short_sleeps_short() {
