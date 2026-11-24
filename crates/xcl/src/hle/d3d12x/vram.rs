@@ -262,15 +262,41 @@ impl Pages {
         if self.cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
             return self.cooling.pop_front().map(|(t, _)| t);
         }
-        let desc = D3D12_HEAP_DESC {
+        let mut desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             // every kind of texture (resource heap tier 2: the only flags for both)
             Flags: D3D12_HEAP_FLAG_NONE,
         };
+        let system = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        // past the video memory budget (`XCL_SPARSE_SPILL`, as for the sparse pools) a pool is
+        // made in system memory; and when the driver refuses one in video memory it is tried
+        // there before the title's texture fails (a retail game asserted on that
+        // E_OUTOFMEMORY while loading on an 8 GB card)
+        let spill = super::sparse::spill_headroom().is_some_and(|h| super::real::local_memory_tight(desc.SizeInBytes + h));
+        if spill {
+            desc.Properties = system;
+        }
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+        let mut made = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap));
+        if made.is_err() {
+            desc.Properties = if spill { D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() } } else { system };
+            made = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap));
+        }
+        if desc.Properties.Type == D3D12_HEAP_TYPE_CUSTOM {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 2 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: pages of title textures in system memory ({n} pools so far, {})", if made.is_ok() { "made" } else { "refused" });
+            }
+        }
+        if let Err(e) = made {
             crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
             return None;
         }

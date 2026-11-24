@@ -575,6 +575,13 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     }
 }
 
+/// `XCL_SPARSE_SPILL`: the video memory (bytes) to keep free of the budget before pools go to
+/// system memory (None: off)
+pub(super) fn spill_headroom() -> Option<u64> {
+    static SPILL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SPILL.get_or_init(|| std::env::var("XCL_SPARSE_SPILL").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0).map(|n| if n == 1 { 512 } else { n } << 20))
+}
+
 impl State {
     #[inline]
     fn window_index(&self, a: usize) -> Option<usize> {
@@ -599,9 +606,7 @@ impl State {
         // retail game's pools and targets went past it and every submit waited for the driver
         // to page, until the title's own watchdog ended it
         // (`XCL_SPARSE_SPILL=<n>`, n > 1: keep n MB of the budget free instead of 512)
-        static SPILL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        let headroom = *SPILL.get_or_init(|| std::env::var("XCL_SPARSE_SPILL").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0).map(|n| if n == 1 { 512 } else { n } << 20));
-        let spill = headroom.is_some_and(|h| super::real::local_memory_tight(desc.SizeInBytes + h));
+        let spill = spill_headroom().is_some_and(|h| super::real::local_memory_tight(desc.SizeInBytes + h));
         if spill {
             desc.Properties = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_CUSTOM,
