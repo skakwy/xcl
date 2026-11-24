@@ -116,6 +116,9 @@ fn report(stalled_s: u64) {
     let mut long: Vec<(&u32, &Waiting)> = waits.iter().flatten().filter(|(_, w)| w.since.elapsed().as_millis() >= 1000).collect();
     long.sort_by_key(|(_, w)| std::cmp::Reverse(w.since.elapsed()));
     crate::xlog_warn!("wait trace: no present for {stalled_s} s – {} of the title's threads have waited 1 s or more", long.len());
+    for (f, signalled, completed, cell) in crate::hle::d3d12x::fence_x::cells() {
+        crate::xlog_warn!("wait trace: fence {f:#x} the title reads: queued to signal up to {signalled:#x}, GPU completed {completed:#x}, cell {cell:#x}");
+    }
     for (tid, w) in long {
         let what: Vec<String> = w
             .handles

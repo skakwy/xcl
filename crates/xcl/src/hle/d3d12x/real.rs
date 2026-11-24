@@ -4815,8 +4815,16 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
         // start); as a stub nothing the title recorded ran on the GPU but its first two frames
         33 if shifted => {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| crate::xlog_info!("D3D12.X: queue #35 ExecuteCommandListsX ({} lists, value {a3:#x}, flags {a4:#x})", a1));
+            // (the first 40 and each new (value, flags): what the value is is not established)
+            {
+                static SEEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                let new = { let mut g = SEEN.lock().unwrap(); let k = (a3, a4); let fresh = !g.contains(&k); if fresh && g.len() < 256 { g.push(k); } fresh };
+                if n <= 40 || new {
+                    crate::xlog_info!("D3D12.X: queue {this:p} #35 ExecuteCommandListsX #{n} ({} lists, value {a3:#x}, flags {a4:#x})", a1);
+                }
+            }
             q_execute_command_lists(this, a1 as u32, a2 as *const *mut c_void);
             0
         }

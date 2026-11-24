@@ -88,6 +88,16 @@ pub(super) fn note_cpu_signal(fence: usize) {
     }
 }
 
+/// The fences whose completed value the title reads (a cell each): (fence, highest value a
+/// queue was told to signal, GPU completed value, cell) – the wait trace's stall report.
+pub fn cells() -> Vec<(usize, u64, u64, u64)> {
+    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter()
+        .flatten()
+        .filter_map(|(&p, f)| f.cell.map(|c| (p, f.signalled, unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(0), c.0.load(Ordering::Acquire))))
+        .collect()
+}
+
 /// fence #12: the address of its completed value
 pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) -> *const u64 {
     let (cell, pending) = {
