@@ -93,6 +93,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let c = unsafe { commit_by_range() };
+                crate::xlog_info!(
+                    "commit by address: below 16 GiB {} MB private + {} MB mapped; 16 GiB..1 TiB (title windows) {} MB + {} MB; above {} MB + {} MB",
+                    mb(c[0][0]), mb(c[0][1]), mb(c[1][0]), mb(c[1][1]), mb(c[2][0]), mb(c[2][1])
+                );
                 let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
                 if evicted > 0 {
                     crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");
@@ -169,4 +174,25 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+/// The process's committed bytes (private, mapped) below 16 GiB, from 16 GiB to 1 TiB (where the
+/// title's memory windows are) and above: which part of the process's commit grows.
+unsafe fn commit_by_range() -> [[u64; 2]; 3] {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE};
+    let mut out = [[0u64; 2]; 3];
+    let mut a = 0x1_0000usize;
+    while a < 0x7FFF_FFFF_0000 {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(a as *const _, &mut m, std::mem::size_of_val(&m)) == 0 {
+            break;
+        }
+        let base = m.BaseAddress as usize;
+        if m.State == MEM_COMMIT && (m.Type == MEM_PRIVATE || m.Type == MEM_MAPPED) {
+            let r = if base < 0x4_0000_0000 { 0 } else if base < 0x100_0000_0000 { 1 } else { 2 };
+            out[r][usize::from(m.Type == MEM_MAPPED)] += m.RegionSize as u64;
+        }
+        a = base.saturating_add(m.RegionSize.max(0x1000));
+    }
+    out
 }
