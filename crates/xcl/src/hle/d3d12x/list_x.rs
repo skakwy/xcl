@@ -1107,6 +1107,17 @@ pub(super) fn armed_summary() -> String {
     v.iter().map(|&(t, q, va, val)| format!("q{} at {va:#x} >= {val:#x} for {t:.1} s", queue_id(q))).collect::<Vec<_>>().join(", ")
 }
 
+/// Whether title queue `queue` holds a GPU wait (a bridged Wait64BitValueX) the GPU has not seen
+/// satisfied: work it signals after that may wait for a list nobody has submitted yet.
+pub(super) fn queue_has_armed_wait(queue: usize) -> bool {
+    if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut g = SYNC_GRAPH.lock().unwrap();
+    let Some(gr) = g.as_mut() else { return false };
+    gr.cells.values_mut().any(|c| c.armed_waits.iter().any(|a| a.waiting_queue == queue) && unsafe { prune_completed_waits(c) } != u64::MAX && c.armed_waits.iter().any(|a| a.waiting_queue == queue))
+}
+
 /// The short id title queues have in the sync log lines.
 pub(super) fn queue_label(q: usize) -> usize {
     queue_id(q)

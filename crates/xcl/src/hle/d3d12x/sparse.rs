@@ -1051,6 +1051,23 @@ impl State {
 
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
+    /// `ranges` in the sparse windows, sorted and merged where they touch.
+    fn window_ranges(&self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && self.window_index(a).is_some()).collect();
+        filtered.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
+        for (a, n) in filtered {
+            match merged.last_mut() {
+                Some(last) if a <= last.0.saturating_add(last.1) => {
+                    let end = (last.0 + last.1).max(a + n);
+                    last.1 = end - last.0;
+                }
+                _ => merged.push((a, n)),
+            }
+        }
+        merged
+    }
+
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
         let Some((rb, p)) = self.readback_buf() else { return };
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
@@ -1285,26 +1302,85 @@ fn note_rb_wait(v: u64, queue: usize) {
     }
 }
 
+/// Readbacks of title queues that held a GPU wait when they were asked for: done when the queue
+/// has passed the fence it signalled after the lists (`pump_deferred`), not by making the sparse
+/// queue wait for it. (Waiting there, the sparse queue stalled behind a title queue's wait for a
+/// list not submitted yet; the title threads waiting for the sparse queue were the ones to submit
+/// it – GTA VI held each 5 s until the wait was released, and its watchdog ended it.)
+static DEFERRED: Mutex<Vec<(ID3D12Fence, Vec<(usize, usize)>, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// The deferred readbacks whose title queue got past them, done now (true: some are left).
+pub unsafe fn pump_deferred() -> bool {
+    let ready: Vec<Vec<(usize, usize)>> = {
+        let mut d = DEFERRED.lock().unwrap();
+        if d.is_empty() {
+            return false;
+        }
+        let mut ready = Vec::new();
+        d.retain(|(f, r, _)| {
+            if f.GetCompletedValue() >= 1 {
+                ready.push(r.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready
+    };
+    if !ready.is_empty() {
+        let mut g = STATE.lock().unwrap();
+        if let Some(s) = g.as_mut() {
+            for r in &ready {
+                let merged = s.window_ranges(r);
+                if !merged.is_empty() {
+                    s.readback_ranges(&merged);
+                }
+            }
+        }
+    }
+    !DEFERRED.lock().unwrap().is_empty()
+}
+
+/// A readback deferred: its title queue signals a fence of its own, and a thread does the copy
+/// once it is passed.
+unsafe fn defer_readback(queue: &ID3D12CommandQueue, ranges: Vec<(usize, usize)>) -> bool {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return false;
+    }
+    let Some(dev) = dev else { return false };
+    let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return false };
+    if queue.Signal(&fence, 1).is_err() {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        crate::xlog_info!("sparse: readback deferred – its title queue holds a GPU wait ({} so far)", n + 1);
+    }
+    DEFERRED.lock().unwrap().push((fence, ranges, std::time::Instant::now()));
+    static PUMP: std::sync::Once = std::sync::Once::new();
+    PUMP.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(|| loop {
+            let left = unsafe { pump_deferred() };
+            std::thread::sleep(std::time::Duration::from_millis(if left { 1 } else { 20 }));
+        });
+    });
+    true
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
-    if filtered.is_empty() {
+    if super::list_x::queue_has_armed_wait(queue.as_raw() as usize) && defer_readback(queue, ranges.to_vec()) {
         return;
     }
-    filtered.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
-    for (a, n) in filtered {
-        match merged.last_mut() {
-            Some(last) if a <= last.0.saturating_add(last.1) => {
-                let end = (last.0 + last.1).max(a + n);
-                last.1 = end - last.0;
-            }
-            _ => merged.push((a, n)),
-        }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    let merged = s.window_ranges(ranges);
+    if merged.is_empty() {
+        return;
     }
     s.rb_value += 1;
     let v = s.rb_value;
