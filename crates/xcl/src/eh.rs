@@ -79,6 +79,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
         }
+        if let Some(lazy) = crate::hle::kernelx::lazy::failure_summary() {
+            extra.push_str(&format!("; {lazy}"));
+        }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
