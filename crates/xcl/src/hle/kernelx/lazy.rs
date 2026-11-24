@@ -145,7 +145,7 @@ pub(crate) fn mark(page: usize) {
 }
 
 /// Whether `page` is mapped and was never used.
-pub(super) fn marked(page: usize) -> bool {
+pub(crate) fn marked(page: usize) -> bool {
     LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
 }
 

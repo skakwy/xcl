@@ -699,6 +699,31 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    // the destination's extent as XCL writes it: its first calls, and any whose last row is
+    // not memory the title has (GTA VI's memcpy crash writes rows far past its block)
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let rows = if t.depth > 0 { m.height * m.depth } else { m.height };
+        let last = if t.depth > 0 { ((rows - 1) / m.height) * slice_pitch as usize + ((rows - 1) % m.height) * row_pitch as usize } else { (rows - 1) * row_pitch as usize };
+        let end = dst as usize + last + row;
+        let mapped = crate::gpu::shader::readable(dst as usize + last, row) || crate::hle::kernelx::lazy::marked(dst as usize + last & !0xFFFF);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 || !mapped {
+            crate::xlog_warn!(
+                "XG CopyFromSubresource #{n}: dst {:#x}..{end:#x} ({}), plane {plane}, sub {sub} (level {i}, slice {k}), {}x{} elements x {} B (row {row} B), depth {}, row pitch {row_pitch:#x}, slice pitch {slice_pitch:#x}, texture {}x{} bpe {} side {}",
+                dst as usize,
+                if mapped { "last row mapped" } else { "LAST ROW NOT MAPPED" },
+                m.width,
+                m.height,
+                t.bpe,
+                m.depth,
+                t.width,
+                t.height,
+                t.bpe,
+                t.side
+            );
+        }
+    }
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
