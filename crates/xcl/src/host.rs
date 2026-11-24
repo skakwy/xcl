@@ -84,6 +84,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
+                if evicted > 0 {
+                    crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");
+                }
                 last = now;
             }
         });
