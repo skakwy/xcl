@@ -4857,22 +4857,46 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    let t0 = std::time::Instant::now();
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
+    let t_refresh = t0.elapsed();
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
         .iter()
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    let (mut t_submit, mut t_readback, mut t_cpu_writes) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let t1 = std::time::Instant::now();
     super::list_x::execute_with_waits(&mapped, |chunk| {
+        let a = std::time::Instant::now();
         f(this, chunk.len() as u32, chunk.as_ptr());
+        let b = std::time::Instant::now();
         super::list_x::readback_sparse_writes(this, chunk);
+        let c = std::time::Instant::now();
         super::list_x::cpu_writes_after(this, chunk);
+        t_submit += b - a;
+        t_readback += c - b;
+        t_cpu_writes += c.elapsed();
     });
+    let t_exec = t1.elapsed();
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
+    // a submit that held the title's thread for long: where the time went
+    let total = t0.elapsed();
+    if total.as_millis() >= 100 {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 40 || k.is_power_of_two() {
+            let ms = |d: std::time::Duration| d.as_millis();
+            crate::xlog_warn!(
+                "D3D12.X: slow ExecuteCommandLists #{k} ({n} lists): {} ms – refresh {} ms, submit {} ms, sparse readback {} ms, CPU writes {} ms, waits {} ms",
+                ms(total), ms(t_refresh), ms(t_submit), ms(t_readback), ms(t_cpu_writes), ms(t_exec.saturating_sub(t_submit + t_readback + t_cpu_writes))
+            );
+        }
+    }
     stop_if_device_removed();
 }
 

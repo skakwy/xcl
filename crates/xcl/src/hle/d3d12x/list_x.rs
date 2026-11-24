@@ -877,7 +877,10 @@ fn note_write(list: usize, va: u64, size: u64) {
 
 unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
     for w in waits {
+        let t = std::time::Instant::now();
+        let _slow = SlowWait(w, t, &SLOW);
         if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
             crate::xlog_warn!(
                 "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
@@ -889,6 +892,19 @@ unsafe fn wait_all(waits: &[PendingWait]) {
                 w.mask,
                 w.read_value()
             );
+        }
+    }
+}
+
+/// A wait that held the submitting thread 100 ms or more: logged when it ends (first 40).
+struct SlowWait<'a>(&'a PendingWait, std::time::Instant, &'a AtomicU64);
+
+impl Drop for SlowWait<'_> {
+    fn drop(&mut self) {
+        let ms = self.1.elapsed().as_millis();
+        if ms >= 100 && once(self.2, 40) {
+            let w = self.0;
+            crate::xlog_warn!("D3D12.X: Wait{}BitValueX held the submit {ms} ms at {:#x} (op {}, want {:#x}, mask {:#x})", w.width * 8, w.va, w.comparison, w.value, w.mask);
         }
     }
 }
