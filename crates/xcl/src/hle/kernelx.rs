@@ -95,6 +95,17 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         FreeLibrary,
         FreeLibraryWhenCallbackReturns,
         DisableThreadLibraryCalls,
+        // synchronization: passed through, traced with `XCL_TRACE_WAITS=1` (`waits`)
+        CreateEventW,
+        CreateEventA,
+        CreateSemaphoreW,
+        CreateSemaphoreExW,
+        CreateMutexA,
+        SetEvent,
+        ReleaseSemaphore,
+        WaitForSingleObject,
+        WaitForSingleObjectEx,
+        WaitForMultipleObjects,
     ]
 }
 
@@ -105,6 +116,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
 mod placeholders;
 pub mod lazy;
+pub mod waits;
+use waits::{CreateEventA, CreateEventW, CreateMutexA, CreateSemaphoreExW, CreateSemaphoreW, ReleaseSemaphore, SetEvent, WaitForMultipleObjects, WaitForSingleObject, WaitForSingleObjectEx};
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
