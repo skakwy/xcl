@@ -858,6 +858,10 @@ static LIST_USES: Mutex<std::collections::BTreeMap<usize, Vec<usize>>> = Mutex::
 /// PC list `list` named `resources` (a barrier, a render-target bind): the placed textures among
 /// them are noted for when it is submitted.
 pub(super) fn note_uses(list: usize, resources: impl IntoIterator<Item = usize>) {
+    // resolved before PLACED_TEXTURES is held: the caller's iterator takes present's RTV lock,
+    // which `note_rtv` holds while a release reaches `forget` (and PLACED_TEXTURES) – the two
+    // threads waited on each other and GTA VI's watchdog ended it
+    let resources: Vec<usize> = resources.into_iter().collect();
     let kept: Vec<usize> = {
         let g = PLACED_TEXTURES.lock().unwrap();
         let Some(placed) = g.as_ref() else { return };
