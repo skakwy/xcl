@@ -230,6 +230,12 @@ fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
+/// `XCL_DSTORAGE_BCPACK_FILL=ok`: a filled BCPack request reports success.
+fn bcpack_fill_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("ok")))
+}
+
 /// BC1 colour block: both endpoints magenta (565 `0xF81F`), every index 0.
 const BC1_MAGENTA: [u8; 8] = [0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0];
 /// BC4 block: both endpoints 255, every index 0.
@@ -1095,7 +1101,11 @@ impl QueueInner {
                     Entry::Refused { hr, req, file, fill } => {
                         if let Some(t) = &fill {
                             // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
+                            // (`XCL_DSTORAGE_BCPACK_FILL=ok`: it succeeds – the title takes no
+                            // error path for textures XCL cannot decode yet)
+                            if unsafe { bcpack_fill(&req, t) } && bcpack_fill_ok() {
+                                continue;
+                            }
                         }
                         self.fail(hr, req, file.as_deref());
                         if since_status >= 0 {
