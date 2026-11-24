@@ -432,6 +432,24 @@ pub fn video_memory() -> Option<(u64, u64)> {
     }
 }
 
+/// The budgets Windows gives the process for local and non-local video memory (past them the
+/// video memory manager pages the process's allocations in and out).
+pub fn video_memory_budget() -> Option<(u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
+    unsafe {
+        let luid = dev.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
+        Some((local.Budget, non_local.Budget))
+    }
+}
+
 /// Whether `extra` more bytes of local video memory would take the process past the budget
 /// Windows gives it (then the driver pages video memory in and out at every submit). `false`
 /// when it cannot be asked.

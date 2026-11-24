@@ -106,6 +106,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     })
                     .collect();
                 crate::xlog_info!("largest committed allocations above 1 TiB: {}", top.join(", "));
+                if let Some((lb, nb)) = crate::hle::d3d12x::real::video_memory_budget() {
+                    let over = |u: u64, b: u64| if u > b { format!(" – {} MB OVER", mb(u - b)) } else { String::new() };
+                    crate::xlog_info!(
+                        "video memory budget: local {} of {} MB{}, non-local {} of {} MB{}",
+                        mb(local), mb(lb), over(local, lb), mb(non_local), mb(nb), over(non_local, nb)
+                    );
+                }
                 let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
                 if evicted > 0 {
                     crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");
