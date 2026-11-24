@@ -172,6 +172,10 @@ const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Page budget: when a round at `EVICT_MIN_AGE` frees too little, the textures unused this long
 /// go too (they are uploaded again from the title's memory when it uses them).
 const EVICT_MIN_AGE_TIGHT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Page budget: the last resort before a pool past the budget – textures not used this long.
+const EVICT_MIN_AGE_LAST: std::time::Duration = std::time::Duration::from_millis(250);
+/// Page budget: tiles one round frees at most (256 MB).
+const EVICT_BATCH_HARD: usize = 4096;
 /// Page budget: textures smaller than this are never evicted (UI, fonts, small lookups).
 const EVICT_MIN_TILES: u32 = 4;
 /// Page budget: tiles freed per eviction round once the pools are at the budget.
@@ -349,13 +353,19 @@ impl Pages {
         let cap = pool_cap();
         if cap > 0 && self.pools.len() >= cap {
             let now = std::time::Instant::now();
-            if self.evict_after.is_none_or(|t| now >= t) {
-                let before = self.free.len() + self.cooling.len();
-                self.evict_lru(EVICT_BATCH, EVICT_MIN_AGE);
-                if self.free.len() + self.cooling.len() - before < EVICT_BATCH / 4 {
-                    self.evict_lru(EVICT_BATCH, EVICT_MIN_AGE_TIGHT);
+            // at the budget, pages no texture uses go back at once (not after `IDLE`)
+            sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.cooling, now + IDLE);
+            if self.free.is_empty() && self.cooling.is_empty() && self.evict_after.is_none_or(|t| now >= t) {
+                // a big batch, so that rounds (each sorts every target) stay rare; older first,
+                // then anything not used in the last `EVICT_MIN_AGE_LAST` – a new pool only when
+                // nothing at all can go (the budget holds; uploads again cost time, not memory)
+                for age in [EVICT_MIN_AGE, EVICT_MIN_AGE_TIGHT, EVICT_MIN_AGE_LAST] {
+                    self.evict_lru(EVICT_BATCH_HARD, age);
+                    if self.free.len() + self.cooling.len() >= EVICT_BATCH / 4 {
+                        break;
+                    }
                 }
-                self.evict_after = (self.free.len() + self.cooling.len() - before < EVICT_BATCH / 4).then(|| now + EVICT_RETRY);
+                self.evict_after = (self.free.is_empty() && self.cooling.is_empty()).then(|| now + EVICT_RETRY);
             }
             if let Some(t) = self.free.pop() {
                 return Some(t);
