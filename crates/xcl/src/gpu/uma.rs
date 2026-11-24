@@ -288,10 +288,9 @@ impl Uma {
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + MAX_WINDOWS * WINDOW;
         let lo = self.title_sparse_start();
-        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
-            return Some(at);
-        }
-        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
+        let at = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false).or_else(|| take_sparse_in(&mut g, lo, end, size, GRAIN, false));
+        trace_sparse("reserve", at, size);
+        at
     }
 
     /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor
@@ -312,7 +311,9 @@ impl Uma {
             }
         }
         let lo = desc.map_or(w_start, |(lo, _)| lo);
-        take_sparse_in(&mut g, lo, w_start + w_len, size, align, true).map(|at| (at, size))
+        let at = take_sparse_in(&mut g, lo, w_start + w_len, size, align, true);
+        trace_sparse("alloc in window", at, size);
+        at.map(|at| (at, size))
     }
 
     /// Reserve an aligned range in the sparse windows that never straddles a 4 GiB window
@@ -328,24 +329,26 @@ impl Uma {
         let end = self.base + MAX_WINDOWS * WINDOW;
         let lo = self.title_sparse_start();
         let above_0 = (self.base + WINDOW).max(lo);
-        if size <= WINDOW {
+        let at = if size <= WINDOW {
             if self.is_sparse_window(0) {
                 if let Some(at) = take_sparse_in(&mut g, lo, self.base + WINDOW, size, align, true) {
+                    trace_sparse("alloc", Some(at), size);
                     return Some((at, size));
                 }
             }
-            take_sparse_in(&mut g, above_0, end, size, align, true).map(|at| (at, size))
+            take_sparse_in(&mut g, above_0, end, size, align, true)
         } else {
-            take_sparse_in(&mut g, above_0, end, size, align, false)
-                .or_else(|| take_sparse_in(&mut g, lo, end, size, align, false))
-                .map(|at| (at, size))
-        }
+            take_sparse_in(&mut g, above_0, end, size, align, false).or_else(|| take_sparse_in(&mut g, lo, end, size, align, false))
+        };
+        trace_sparse("alloc", at, size);
+        at.map(|at| (at, size))
     }
 
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
         let mut g = self.sparse_free.lock().unwrap();
         let size = g.1.remove(&p)?;
+        trace_sparse("release", Some(p), size);
         let (mut start, mut len) = (p, size);
         if let Some((&o, &l)) = g.0.range(..p).next_back() {
             if o + l == p {
@@ -949,5 +952,18 @@ mod tests {
         assert_eq!(u.sparse_used(), 0);
         // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another.
         assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
+    }
+}
+
+/// `XCL_TRACE_SPARSE=1`: every reservation (and release) of 1 MiB or more in the sparse windows
+/// into the log, with the caller – who last had an address a title later faults on.
+fn trace_sparse(what: &str, at: Option<usize>, size: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if size < 1 << 20 || !*ON.get_or_init(|| std::env::var_os("XCL_TRACE_SPARSE").is_some()) {
+        return;
+    }
+    match at {
+        Some(a) => crate::xlog_info!("sparse: {what} {a:#x}+{size:#x} (to {:#x})", a + size),
+        None => crate::xlog_info!("sparse: {what} of {size:#x} found no room"),
     }
 }
