@@ -668,9 +668,9 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
 static PHASE: AtomicU64 = AtomicU64::new(0);
 static PHASE_SINCE: AtomicU64 = AtomicU64::new(0);
 static PHASE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-const PHASE_NAMES: [&str; 6] = ["-", "write watch", "sparse upload", "target tile mapping", "texture list", "texture uploads"];
+const PHASE_NAMES: [&str; 8] = ["-", "write watch", "sparse upload", "target tile mapping", "texture list", "texture uploads", "the driver's ExecuteCommandLists", "PresentX"];
 
-fn enter_phase(k: u64) {
+pub(super) fn enter_phase(k: u64) {
     let t0 = *PHASE_T0.get_or_init(|| {
         let _ = std::thread::Builder::new().name("xcl-refresh-monitor".into()).spawn(phase_monitor);
         std::time::Instant::now()
@@ -688,9 +688,14 @@ fn phase_monitor() {
         let ms = (t0.elapsed().as_micros() as u64).saturating_sub(since) / 1000;
         if k != 0 && ms >= 1000 && reported != (k, since) {
             reported = (k, since);
-            crate::xlog_warn!("title textures: the submit's refresh has been in '{}' for {ms} ms", PHASE_NAMES[k as usize]);
+            crate::xlog_warn!("title textures: the title's submit has been in '{}' for {ms} ms", PHASE_NAMES[k as usize]);
         }
     }
+}
+
+/// The step `enter_phase` named is over.
+pub(super) fn leave_phase() {
+    PHASE.store(0, Ordering::Release);
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {

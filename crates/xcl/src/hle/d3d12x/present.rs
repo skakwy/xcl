@@ -53,8 +53,10 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
         return 0;
     }
     let token = (planes as *const u64).read_unaligned();
+    super::title_textures::enter_phase(7);
     let _present = PRESENTX_LOCK.lock().unwrap();
     present_x_frame(queue, plane_count, planes);
+    super::title_textures::leave_phase();
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
     super::frame::mark_flipped(token);

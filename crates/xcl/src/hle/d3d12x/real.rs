@@ -4871,7 +4871,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let t1 = std::time::Instant::now();
     super::list_x::execute_with_waits(&mapped, |chunk| {
         let a = std::time::Instant::now();
+        super::title_textures::enter_phase(6);
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::title_textures::leave_phase();
         let b = std::time::Instant::now();
         super::list_x::readback_sparse_writes(this, chunk);
         let c = std::time::Instant::now();
