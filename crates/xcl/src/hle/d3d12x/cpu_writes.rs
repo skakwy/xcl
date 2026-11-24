@@ -83,12 +83,19 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
 
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
+    // a lazily committed page of the title's (`kernelx::lazy`) is only reserved until its first
+    // access: committed here, or the write the title waits for was dropped without a word
+    crate::hle::kernelx::lazy::ensure(va, 4 * words.len());
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-        return;
-    }
-    if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + 4 * words.len() {
+    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT
+        || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + 4 * words.len()
+    {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: a bottom-of-pipe write to {va:#x} ({} words) dropped: state {:#x}, protect {:#x} ({n} so far)", words.len(), m.State, m.Protect);
+        }
         return;
     }
     for (i, &w) in words.iter().enumerate() {
@@ -98,6 +105,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
 
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
 unsafe fn write_u64_now(va: usize, value: u64) {
+    crate::hle::kernelx::lazy::ensure(va, 8);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
     let Some(end) = va.checked_add(8) else { return };
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();

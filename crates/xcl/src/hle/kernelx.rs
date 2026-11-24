@@ -1390,13 +1390,31 @@ fn fitted_affinity(mask: usize, what: &str) -> usize {
     fit
 }
 
+/// `XCL_IGNORE_AFFINITY=1`: the title's thread affinities are answered as set but not applied –
+/// a title made for 14 hardware threads folds onto fewer (`fit_affinity_mask`: a 12-thread CPU
+/// pins two of its threads per CPU on the first two), and threads that spin for each other then
+/// share a CPU
+fn ignore_affinity() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_IGNORE_AFFINITY").is_ok_and(|v| v.trim() == "1"))
+}
+
 pub unsafe extern "system" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> usize {
+    if ignore_affinity() {
+        let all = fitted_affinity(usize::MAX, "SetThreadAffinityMask");
+        return thr::SetThreadAffinityMask(h, all);
+    }
     thr::SetThreadAffinityMask(h, fitted_affinity(mask, "SetThreadAffinityMask"))
 }
 
 pub unsafe extern "system" fn SetThreadGroupAffinity(h: HANDLE, a: *const GROUP_AFFINITY, prev: *mut GROUP_AFFINITY) -> BOOL {
     if a.is_null() || (*a).Group != 0 {
         return thr::SetThreadGroupAffinity(h, a, prev);
+    }
+    if ignore_affinity() {
+        let mut all = *a;
+        all.Mask = fitted_affinity(usize::MAX, "SetThreadGroupAffinity");
+        return thr::SetThreadGroupAffinity(h, &all, prev);
     }
     let mut fit = *a;
     fit.Mask = fitted_affinity(fit.Mask, "SetThreadGroupAffinity");
