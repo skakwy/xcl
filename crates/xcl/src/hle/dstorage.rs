@@ -727,6 +727,13 @@ fn writable(p: usize, n: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }
+    // `VirtualQuery` sizes the whole region around an address by walking it: 15–25 ms a call in a
+    // title's gigabytes of committed memory, once per request – a retail game's 8 000 loading
+    // requests spent 69 s here and 4 s reading and inflating. The pages in the working set
+    // answer in one call; a region found committed and writable is not walked again for a while.
+    if resident_and_writable(p, end) || WRITABLE_REGIONS.lock().unwrap().iter().any(|r| r.0 <= p && end <= r.1 && r.2.elapsed() < REGION_TTL) {
+        return true;
+    }
     let mut at = p;
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -737,9 +744,48 @@ fn writable(p: usize, n: usize) -> bool {
         if m.State != MEM_COMMIT || m.Protect & rw == 0 || m.Protect & 0x100 != 0 {
             return false;
         }
-        at = m.BaseAddress as usize + m.RegionSize;
+        let (base, end_r) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
+        let mut g = WRITABLE_REGIONS.lock().unwrap();
+        g.retain(|r| r.2.elapsed() < REGION_TTL && !(r.0 < end_r && base < r.1));
+        if g.len() >= 64 {
+            g.remove(0);
+        }
+        g.push((base, end_r, std::time::Instant::now()));
+        drop(g);
+        at = end_r;
     }
     true
+}
+
+/// Regions `writable` found committed and writable: (start, end, when) – trusted for `REGION_TTL`.
+static WRITABLE_REGIONS: Mutex<Vec<(usize, usize, std::time::Instant)>> = Mutex::new(Vec::new());
+const REGION_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether each page of `[p, end)` (up to 32 pages) is in the working set with a writable
+/// protection, asked of the kernel in one call (`gpu::shader::readable` does the same for reads).
+fn resident_and_writable(p: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const MAX_PAGES: usize = 32;
+    let first = p >> 12;
+    let pages = ((end - 1) >> 12) - first + 1;
+    if pages > MAX_PAGES {
+        return false;
+    }
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
+    for (k, e) in ws[..pages].iter_mut().enumerate() {
+        e.VirtualAddress = ((first + k) << 12) as *mut c_void;
+    }
+    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+    if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut c_void, size) } == 0 {
+        return false;
+    }
+    // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
+    let rw = 0x04 | 0x08 | 0x40 | 0x80;
+    ws[..pages].iter().all(|e| {
+        let flags = unsafe { e.VirtualAttributes.Flags };
+        let protect = ((flags >> 4) & 0x7FF) as u32;
+        flags & 1 != 0 && protect & rw != 0 && protect & 0x100 == 0
+    })
 }
 
 fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), HRESULT> {
