@@ -90,11 +90,20 @@ pub unsafe fn hold_execute(queue: *mut c_void, n: u32, lists: *const *mut c_void
     let given: Vec<usize> = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| l as usize).collect();
     let behind = queue_held(queue as usize);
     let pc = mapped(&given);
-    let wait = super::list_x::unsubmitted_wait(&pc);
-    let pc: Vec<usize> = pc.iter().map(|&l| l as usize).collect();
-    if !behind && wait.is_none() {
+    let at = super::list_x::unsubmitted_wait_at(&pc);
+    if !behind && at.is_none() {
         return false;
     }
+    let wait = at.map(|(_, va, v)| (va, v));
+    // the segments before the one that waits run now (their work, and the writes the title's
+    // other threads wait for, as on the console); the rest is held
+    let first = if behind { 0 } else { at.map_or(0, |(i, _, _)| i) };
+    if first > 0 {
+        RELEASING.with(|r| r.set(true));
+        super::real::execute_held(queue, &pc[..first]);
+        RELEASING.with(|r| r.set(false));
+    }
+    let pc: Vec<usize> = pc[first..].iter().map(|&l| l as usize).collect();
     static N: AtomicUsize = AtomicUsize::new(0);
     let k = N.fetch_add(1, Ordering::Relaxed);
     if k < 16 || k.is_power_of_two() {
@@ -129,7 +138,7 @@ pub fn hold_wait(queue: *mut c_void, fence: usize, value: u64) -> bool {
 /// Whether the operation at the front of a queue can go now.
 unsafe fn ready(op: &Op) -> bool {
     match op {
-        Op::Execute { lists, wait, since, .. } => {
+        Op::Execute { pc, wait, since, .. } => {
             if since.elapsed() >= HOLD_LIMIT {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -138,7 +147,8 @@ unsafe fn ready(op: &Op) -> bool {
                 return true;
             }
             // what it was held for, and whatever else of it waits on an unsubmitted value
-            wait.is_none_or(|(va, v)| super::list_x::wait_released(va, v)) && super::list_x::unsubmitted_wait(&mapped(lists)).is_none()
+            let pc: Vec<*mut c_void> = pc.iter().map(|&l| l as *mut c_void).collect();
+            wait.is_none_or(|(va, v)| super::list_x::wait_released(va, v)) && super::list_x::unsubmitted_wait(&pc).is_none()
         }
         _ => true,
     }
@@ -213,8 +223,9 @@ unsafe fn run(queue: usize, op: Op) {
     RELEASING.with(|r| r.set(true));
     let q = queue as *mut c_void;
     match op {
-        Op::Execute { lists, .. } => {
-            let raw: Vec<*mut c_void> = lists.iter().map(|&l| l as *mut c_void).collect();
+        // the PC lists (segments) themselves: the part of a list that already went is not again
+        Op::Execute { pc, .. } => {
+            let raw: Vec<*mut c_void> = pc.iter().map(|&l| l as *mut c_void).collect();
             super::real::execute_held(q, &raw);
         }
         Op::Signal { fence, value, x } => super::real::signal_held(q, fence, value, x),

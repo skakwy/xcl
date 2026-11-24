@@ -20,6 +20,8 @@ use super::console_list::{self, Layout, Param};
 
 #[derive(Default)]
 struct State {
+    /// a draw or dispatch was recorded since the last Reset (`has_work`)
+    work: bool,
     layout: Option<Arc<Layout>>,
     args: Vec<u8>,
     /// the graphics root signature's layout and arguments
@@ -72,10 +74,17 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
+/// Whether `list` recorded a draw or dispatch since its last Reset (a wait after it is split
+/// off: the work before it runs before the wait, as on the console).
+pub(super) fn has_work(list: *mut c_void) -> bool {
+    STATES.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.work)
+}
+
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.work = false;
         s.pso = initial_pso;
         s.layout = None;
         s.args.clear();
@@ -439,6 +448,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     }
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
+            with(this, |s| s.work = true);
             count(DRAWS);
             Some(list)
         }
@@ -726,7 +736,10 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            with(this, |s| s.work = true);
+            count(DISPATCHES);
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

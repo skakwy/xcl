@@ -1122,6 +1122,11 @@ pub(super) fn queue_has_armed_wait(queue: usize) -> bool {
 /// to write yet, though one is recorded to (`hold`): (address, value). A wait the memory already
 /// satisfies, or a write by an earlier list of the same batch (or the same list), does not count.
 pub(super) unsafe fn unsubmitted_wait(lists: &[*mut c_void]) -> Option<(u64, u64)> {
+    unsubmitted_wait_at(lists).map(|(_, va, v)| (va, v))
+}
+
+/// `unsubmitted_wait` with the index of the list that waits.
+pub(super) unsafe fn unsubmitted_wait_at(lists: &[*mut c_void]) -> Option<(usize, u64, u64)> {
     if PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         return None;
     }
@@ -1130,7 +1135,7 @@ pub(super) unsafe fn unsubmitted_wait(lists: &[*mut c_void]) -> Option<(u64, u64
         lists.iter().map(|&l| g.as_ref().and_then(|m| m.get(&(l as usize))).map(|s| (s.pending_waits.clone(), s.write64_signals.clone())).unwrap_or_default()).collect()
     };
     let mut batch_writes: Vec<(u64, u64)> = Vec::new();
-    for (waits, writes) in per_list {
+    for (i, (waits, writes)) in per_list.into_iter().enumerate() {
         for w in &waits {
             if w.width != 8 || w.comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32 || w.mask != u64::MAX || w.is_satisfied() {
                 continue;
@@ -1141,7 +1146,7 @@ pub(super) unsafe fn unsubmitted_wait(lists: &[*mut c_void]) -> Option<(u64, u64
             let g = SYNC_GRAPH.lock().unwrap();
             let Some(c) = g.as_ref().and_then(|gr| gr.cells.get(&w.va)) else { continue };
             if !c.non_monotonic && c.recorded_max >= w.value && c.submitted_max < w.value && c.cpu_signaled_max < w.value {
-                return Some((w.va, w.value));
+                return Some((i, w.va, w.value));
             }
         }
         batch_writes.extend(writes);
@@ -2542,13 +2547,17 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if comparison == D3D12_COMPARISON_FUNC_NEVER.0 as u32 {
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
+    // a wait after draws or dispatches of the same list is split off too: the work before it
+    // runs before the wait, as on the console (hoisted before the whole list, a held or waiting
+    // list kept back work the title's other threads waited for)
+    let work = super::bind::has_work(list);
     let need_split = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if s.has_prior_write(va, n) {
             return;
         }
-        if s.write64_signals.is_empty() {
+        if s.write64_signals.is_empty() && !work {
             s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
             return;
         }
