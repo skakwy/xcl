@@ -214,10 +214,19 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let raw_pso = with(this, |s| s.pso);
+    let pso = super::pso_async::resolve_for_indirect(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
+        if super::pso_async::is_pending_compute(raw_pso) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with pending compute pipeline ({raw_pso:#x}) skipped");
+            }
+            count(DISPATCHES_SKIPPED);
+            return;
+        }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -673,7 +682,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let pso = super::pso_async::resolve_for_indirect(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1122,10 +1131,52 @@ mod tests {
             "failed async compute stand-in must not enter translated ExecuteIndirect path"
         );
 
+        // 3. Background compute build is still PENDING after timeout: ExecuteIndirect must skip
+        // cleanly (like Dispatch) rather than forwarding the stand-in to PC ExecuteIndirect.
+        let standin_pending = 0x7200_0005usize;
+        let real_pending = 0x7200_0006usize;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        pso_async::submit_lazy(
+            standin_pending,
+            true,
+            Box::new(move || {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+                real::register_translated_compute_for_test(real_pending);
+                real_pending
+            }),
+        );
+        assert_eq!(
+            pso_async::resolve_compute_with_limit_for_test(standin_pending, std::time::Duration::from_millis(20)),
+            standin_pending
+        );
+        assert!(pso_async::is_pending_compute(standin_pending));
+
+        reset(list_ptr, 0x7200_0100, standin_pending);
+        let before_pending = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, 0x7200_00F1, 1, 0, 0, 0, 0);
+        }
+        let after_pending = counts_snapshot();
+        assert!(after_pending[DISPATCHES_SKIPPED] > before_pending[DISPATCHES_SKIPPED]);
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            1,
+            "pending async compute stand-in must be skipped, not forwarded to PC ExecuteIndirect"
+        );
+
+        tx.send(()).unwrap();
+        let wait = std::time::Instant::now();
+        while pso_async::is_pending_compute(standin_pending) {
+            assert!(wait.elapsed() < std::time::Duration::from_secs(5), "pending compute PSO never completed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         forget(list_ptr);
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
+        let _ = pso_async::released(standin_pending);
         real::forget_pso_for_test(real_ok);
+        real::forget_pso_for_test(real_pending);
     }
 
     #[test]
