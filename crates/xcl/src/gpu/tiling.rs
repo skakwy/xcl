@@ -396,13 +396,43 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
+        let t = &self.layout;
+        let e = 1usize << t.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
+        if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
+            // linear: a row's elements are contiguous, so it is copied whole (the elements that
+            // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
+            let row = l.width * e;
+            for y in 0..l.height {
+                let o = self.element_at(&l, 0, y, slice);
+                let n = src.len().saturating_sub(o).min(row) / e * e;
+                if n > 0 {
+                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
+                }
+            }
+            return out;
+        }
+        // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
+        // depends on y (and the slice) once per row – per element only two lookups and an XOR.
+        // Element by element it was most of a retail game's render thread while it streamed
+        // textures the CPU writes.
+        let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
+        let pitch_blocks = l.pitch.div_ceil(t.block_w);
+        let columns: Vec<(usize, u32)> = (0..l.width)
+            .map(|x| {
+                let x = x + l.origin.0;
+                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
+            })
+            .collect();
+        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
+        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
+            let y = y + l.origin.1;
+            let row_blocks = (y / t.block_h) * pitch_blocks;
+            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
+            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
+                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
                 if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    dst.copy_from_slice(s);
                 }
             }
         }
@@ -445,6 +475,73 @@ mod tests {
             v.push(PipeConfig { pipes_log2: p, pkrs_log2: k });
         }
         v
+    }
+
+    /// Linear levels are copied a row at a time: the same bytes as element by element, for every
+    /// element size, padded rows, every mip and a source cut short (inside a row and inside an
+    /// element).
+    #[test]
+    fn linear_levels_detile_by_rows_as_by_elements() {
+        let by_elements = |c: &Chain, src: &[u8], i: usize| {
+            let l = c.levels[i];
+            let e = 1usize << c.layout.elem_log2;
+            let mut out = vec![0u8; l.width * l.height * e];
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let o = c.element_at(&l, x, y, 0);
+                    if let Some(s) = src.get(o..o + e) {
+                        out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    }
+                }
+            }
+            out
+        };
+        for e in 0..5u32 {
+            for (w, h, mips) in [(3840u32, 4u32, 1u32), (1920, 3, 1), (77, 13, 4), (1, 1, 1), (300, 200, 9)] {
+                let c = Chain::new(Layout::new(0, e, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap(), w, h, 1, mips);
+                let full: Vec<u8> = (0..c.slice_bytes).map(|k| (k * 7 + 3) as u8 | 1).collect();
+                for cut in [full.len(), full.len() / 2 + 1, 5, 0] {
+                    let src = &full[..cut];
+                    for i in 0..c.levels.len() {
+                        assert_eq!(c.detile_level(src, i, 0), by_elements(&c, src, i), "e{e} {w}x{h} level {i} src {cut} B");
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// `detile_level` (offsets split by row and column) gives the bytes element-by-element
+    /// `element_at` does: every mode, element size and pipe configuration, every level (mip
+    /// tails too), a base swizzle and a slice, and a source cut short (bytes past it read as 0).
+    #[test]
+    fn detile_level_matches_element_by_element() {
+        for mode in MODES {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    lay.base_xor = (lay.block_bytes / 2) & !((1 << e) - 1);
+                    let c = Chain::new(lay, 77, 45, 1, 7);
+                    let mem: Vec<u8> = (0..c.slice_bytes * 2).map(|i| (i * 131 % 251) as u8).collect();
+                    let short = &mem[..mem.len() * 3 / 5];
+                    let es = 1usize << e;
+                    for (k, l) in c.levels.iter().enumerate() {
+                        for (slice, src) in [(0, &mem[..]), (3, short)] {
+                            let mut want = vec![0u8; l.width * l.height * es];
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at(l, x, y, slice);
+                                    if let Some(s) = src.get(o..o + es) {
+                                        want[(y * l.width + x) * es..][..es].copy_from_slice(s);
+                                    }
+                                }
+                            }
+                            assert!(c.detile_level(src, k, slice) == want, "mode {mode} e {e} {cfg:?} level {k} slice {slice}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// every mode, element size and pipe configuration: the in-block mapping is a permutation
