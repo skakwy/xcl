@@ -173,6 +173,10 @@ const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 const EVICT_MIN_TILES: u32 = 4;
 /// Page budget: tiles freed per eviction round once the pools are at the budget.
 const EVICT_BATCH: usize = 512;
+/// Page budget: after a round that freed under a quarter of `EVICT_BATCH`, the next waits this
+/// long (new pools meanwhile): a round sorts every target, and with tens of thousands of them
+/// (a retail game streaming its world) one per tile held the pages' lock until frames stopped.
+const EVICT_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
 fn pool_cap() -> usize {
@@ -284,6 +288,8 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// page budget: no eviction round before this (`EVICT_RETRY`)
+    evict_after: Option<std::time::Instant>,
 }
 
 // D3D12 objects are free-threaded
@@ -316,6 +322,7 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            evict_after: None,
         })
     }
 
@@ -333,7 +340,12 @@ impl Pages {
         }
         let cap = pool_cap();
         if cap > 0 && self.pools.len() >= cap {
-            self.evict_lru(EVICT_BATCH);
+            let now = std::time::Instant::now();
+            if self.evict_after.is_none_or(|t| now >= t) {
+                let before = self.free.len() + self.cooling.len();
+                self.evict_lru(EVICT_BATCH);
+                self.evict_after = (self.free.len() + self.cooling.len() - before < EVICT_BATCH / 4).then(|| now + EVICT_RETRY);
+            }
             if let Some(t) = self.free.pop() {
                 return Some(t);
             }
@@ -513,6 +525,29 @@ impl Pages {
         }
     }
 
+    /// Map target `key` again (its tiles shared or taken anew) if it was unmapped; false when it
+    /// is not one of these targets or no tile could be had.
+    unsafe fn remap(&mut self, dev: &ID3D12Device, key: usize) -> bool {
+        let Some((va, console_bytes, total, mapped)) = self.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+            return false;
+        };
+        if mapped {
+            return true;
+        }
+        let raw = key as *mut c_void;
+        let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { return false };
+        let Some((used, used_extra)) = self.bind(dev, res, va, console_bytes, total) else {
+            return false;
+        };
+        if let Some(t) = self.targets.get_mut(&key) {
+            t.used = used;
+            t.used_extra = used_extra;
+            t.mapped = true;
+            t.touched = std::time::Instant::now();
+        }
+        true
+    }
+
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
@@ -683,22 +718,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
-        return false;
-    };
-    if mapped {
-        return true;
-    }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
-        return false;
-    };
-    if let Some(t) = pages.targets.get_mut(&key) {
-        t.used = used;
-        t.used_extra = used_extra;
-        t.mapped = true;
-        t.touched = std::time::Instant::now();
-    }
-    true
+    pages.remap(&dev, key)
 }
 
 /// Page budget: `res` was evicted by the page budget; true once, and the caller maps it
@@ -773,8 +793,11 @@ pub(super) fn list_reset(list: usize) {
     }
 }
 
-/// The PC lists `lists` are about to be submitted: the targets they named are used now.
-pub(super) fn submitting(lists: &[*mut c_void]) {
+/// The PC lists `lists` are about to be submitted on `queue`: the targets they named are used
+/// now, and those the page budget evicted are mapped again first (the queue waits for that;
+/// mapped after the submit, these lists ran on unmapped tiles). Their upload follows at the
+/// next submit (`title_textures::submitted`, which finds them in `EVICTED`).
+pub(super) unsafe fn submitting(queue: &ID3D12CommandQueue, lists: &[*mut c_void]) {
     let used: Vec<usize> = {
         let g = LIST_USES.lock().unwrap();
         if g.is_empty() {
@@ -786,13 +809,25 @@ pub(super) fn submitting(lists: &[*mut c_void]) {
         return;
     }
     let now = std::time::Instant::now();
-    let mut g = PAGES.lock().unwrap();
-    for pages in g.values_mut().flatten() {
-        for r in &used {
-            if let Some(t) = pages.targets.get_mut(r) {
+    let mut remapped = false;
+    {
+        let mut g = PAGES.lock().unwrap();
+        for (&dev, pages) in g.iter_mut() {
+            let Some(pages) = pages.as_mut() else { continue };
+            let draw = dev as *mut c_void;
+            let Some(dev) = ID3D12Device::from_raw_borrowed(&draw) else { continue };
+            for &r in &used {
+                let Some(t) = pages.targets.get_mut(&r) else { continue };
                 t.touched = now;
+                // (only what the budget evicted: a superseded texture stays unmapped)
+                if !t.mapped && EVICTED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&r)) {
+                    remapped |= pages.remap(dev, r);
+                }
             }
         }
+    }
+    if remapped {
+        before_execute(queue);
     }
 }
 

@@ -2106,6 +2106,11 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
     if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+        // a view of it made again: it is in use (the page budget's least-recently-used order;
+        // an evicted one comes back at its next submit through the list's barriers)
+        if r != 0 {
+            super::vram::touch(r);
+        }
         return r as *mut c_void;
     }
     let mut r = std::ptr::null_mut();
@@ -5133,8 +5138,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    // the targets these lists use are recent (the page budget's least-recently-used order)
-    super::vram::submitting(&mapped);
+    // the targets these lists use are recent (the page budget's least-recently-used order);
+    // evicted ones are mapped again before the lists run
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
+        super::vram::submitting(q, &mapped);
+    }
     let (mut t_submit, mut t_readback, mut t_cpu_writes) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
     let t1 = std::time::Instant::now();
     super::list_x::execute_with_waits(&mapped, |chunk| {
