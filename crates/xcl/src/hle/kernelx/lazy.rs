@@ -82,7 +82,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
-    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
+    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) || wild_commit(page) {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
         EXCEPTION_CONTINUE_SEARCH
@@ -100,6 +100,41 @@ unsafe fn allows(access: usize, at: usize) -> bool {
         0 => m.Protect & reads != 0,
         1 => m.Protect & writes != 0,
         _ => false,
+    }
+}
+
+/// `XCL_SPARSE_WILD_COMMIT=1`: the title touched a page of a sparse window that no reservation
+/// holds (GTA VI's streaming memcpy, 0x6ac..0x6ff above its last block): the page is committed
+/// there and the access goes on (an experiment – where does the title get such addresses?).
+unsafe fn wild_commit(page: usize) -> bool {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if !wild_enabled() {
+        return false;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    if !u.is_sparse(page) || u.sparse_reservation(page).is_some() {
+        return false;
+    }
+    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        return false;
+    }
+    crate::hle::d3d12x::sparse::committed(page, PAGE);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 32 || k.is_power_of_two() {
+        crate::xlog_warn!("sparse window: page {page:#x} outside every reservation committed on its first access (#{k})");
+    }
+    true
+}
+
+fn wild_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_WILD_COMMIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Under `XCL_SPARSE_WILD_COMMIT=1` the handler is there from the start.
+pub(crate) fn install_if_wild() {
+    if wild_enabled() {
+        install();
     }
 }
 

@@ -249,6 +249,7 @@ const PAGE_GPU_X: u32 = 0x2_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+    lazy::install_if_wild();
     // the title's memory in the windows is of the console's 64 KiB pages (its reservations there
     // are whole ones): a commit that ends inside a page has all of it on the console, and a title
     // writes past its last 4 KiB into the rest (GTA VI's memcpy at game+0x979f5b faulted on a
