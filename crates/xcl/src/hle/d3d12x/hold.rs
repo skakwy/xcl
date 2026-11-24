@@ -193,6 +193,13 @@ pub unsafe fn flush_list(list: usize) {
     if HOLDING.load(Ordering::Acquire) == 0 || releasing() {
         return;
     }
+    // only a held list waits for the release lock: XCL's own lists are reset with other locks held
+    // (title_textures' upload list, under the refresh lock a release takes in turn – the two
+    // threads waited on each other)
+    let is_held = |m: &HashMap<usize, VecDeque<Op>>| m.values().any(|ops| ops.iter().any(|op| matches!(op, Op::Execute { lists, pc, .. } if lists.contains(&list) || pc.contains(&list))));
+    if !HELD.lock().unwrap().as_ref().is_some_and(is_held) {
+        return;
+    }
     let _pump = PUMP.lock().unwrap();
     let ops: Vec<(usize, Op)> = {
         let mut g = HELD.lock().unwrap();
