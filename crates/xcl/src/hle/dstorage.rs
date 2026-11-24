@@ -271,6 +271,27 @@ enum FillTarget {
 
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks.
 unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
+    let ok = bcpack_fill_inner(r, target);
+    if !ok {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "DirectStorage: BCPack fill failed: mode {}, {}, destination {:#x} ({} bytes, page offset {})",
+                r.bcpack(),
+                match target {
+                    FillTarget::Pages(p) => format!("{} physical pages", p.len()),
+                    FillTarget::Virtual => "virtual".to_string(),
+                },
+                r.destination,
+                r.destination_size,
+                r.destination_page_offset
+            );
+        }
+    }
+    ok
+}
+
+unsafe fn bcpack_fill_inner(r: &Request, target: &FillTarget) -> bool {
     let Some(block) = bcpack_fill_block(r.bcpack()) else { return false };
     let n = r.destination_size as usize;
     let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
