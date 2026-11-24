@@ -142,6 +142,22 @@ fn report(stalled_s: u64) {
     }
 }
 
+/// A WaitFrameEventX in progress (`d3d12x::frame`): its handles (the first the frame event's own)
+pub fn frame_wait_begin(ty: u32, timeout: u32, flags: u32, handles: &[HANDLE]) -> Option<u32> {
+    if !on() {
+        return None;
+    }
+    monitor();
+    let tid = unsafe { th::GetCurrentThreadId() };
+    let w = Waiting { handles: handles.iter().map(|&h| h as usize).collect(), since: Instant::now(), from: format!("WaitFrameEventX(type {ty}, flags {flags:#x}; first handle the frame event)"), timeout, all: flags & 1 != 0 };
+    WAITS.lock().unwrap().get_or_insert_with(HashMap::new).insert(tid, w);
+    Some(tid)
+}
+
+pub fn frame_wait_end(tid: Option<u32>) {
+    end(tid);
+}
+
 pub unsafe extern "system" fn CreateEventW(attr: *const c_void, manual: BOOL, initial: BOOL, name: *const u16) -> HANDLE {
     made(th::CreateEventW(attr as _, manual, initial, name), if manual != 0 { "manual-reset event" } else { "auto-reset event" })
 }

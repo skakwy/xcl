@@ -214,8 +214,12 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
         }
         c.generation += 1;
     });
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| crate::xlog_info!("D3D12.X: frame interval {len_us} µs (periodicity {periodicity}, flags {flags:#x})"));
+    // every change (the first only used to be logged): a title that lowers its frame rate
+    // when it falls behind sets a new interval mid-game
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    if LAST.swap(((len_us as u64) << 32) | flags as u64, Ordering::Relaxed) != (((len_us as u64) << 32) | flags as u64) {
+        crate::xlog_info!("D3D12.X: frame interval {len_us} µs (periodicity {periodicity}, flags {flags:#x}) – the origin is unscheduled until the title schedules it again");
+    }
     SetEvent(wake());
     S_FALSE
 }
@@ -252,6 +256,13 @@ unsafe fn note_signaled(block: *const u8, index: i32) {
 /// device #79 ScheduleFrameEventX(type, offset µs, ancillary, flags)
 pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, offset_us: u32, block: *const u8, flags: u32) -> HRESULT {
     trace_calls(format_args!("ScheduleFrameEventX(type {ty}, offset {offset_us} µs, block {block:p}, flags {flags:#x})"));
+    {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 12 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: ScheduleFrameEventX #{n}: type {ty}, offset {offset_us} µs, flags {flags:#x}");
+        }
+    }
     let unschedule = flags & UNSCHEDULE != 0;
     let invalid = with(|c| c.interval_us == 0 || ty as usize >= TYPES || (!c.active && ty != 0) || (unschedule && (ty == 0 || !c.kinds[0].scheduled)));
     if invalid {
@@ -333,7 +344,9 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     };
     let mut hs = vec![internal as HANDLE];
     hs.extend(extra);
+    let tid = crate::hle::kernelx::waits::frame_wait_begin(ty, timeout_ms, flags, &hs);
     let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
+    crate::hle::kernelx::waits::frame_wait_end(tid);
     ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
     if r == WAIT_TIMEOUT {
         ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
