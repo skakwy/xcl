@@ -21,8 +21,9 @@ const HOLD_LIMIT: Duration = Duration::from_secs(5);
 
 /// An operation on a queue kept in order behind a held submission.
 enum Op {
-    /// ExecuteCommandLists with the title's lists (as given) and the wait it is held for
-    Execute { lists: Vec<usize>, wait: Option<(u64, u64)>, since: Instant },
+    /// ExecuteCommandLists with the title's lists (as given, and the PC lists they run as) and the
+    /// wait it is held for
+    Execute { lists: Vec<usize>, pc: Vec<usize>, wait: Option<(u64, u64)>, since: Instant },
     /// Signal(fence, value) – `x`: SignalX
     Signal { fence: usize, value: u64, x: bool },
     /// Wait(fence, value)
@@ -88,7 +89,9 @@ pub unsafe fn hold_execute(queue: *mut c_void, n: u32, lists: *const *mut c_void
     }
     let given: Vec<usize> = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| l as usize).collect();
     let behind = queue_held(queue as usize);
-    let wait = super::list_x::unsubmitted_wait(&mapped(&given));
+    let pc = mapped(&given);
+    let wait = super::list_x::unsubmitted_wait(&pc);
+    let pc: Vec<usize> = pc.iter().map(|&l| l as usize).collect();
     if !behind && wait.is_none() {
         return false;
     }
@@ -101,7 +104,7 @@ pub unsafe fn hold_execute(queue: *mut c_void, n: u32, lists: *const *mut c_void
             None => crate::xlog_info!("D3D12.X: submission on q{q} held behind an earlier one ({} so far)", k + 1),
         }
     }
-    push(queue as usize, Op::Execute { lists: given, wait, since: Instant::now() });
+    push(queue as usize, Op::Execute { lists: given, pc, wait, since: Instant::now() });
     true
 }
 
@@ -126,7 +129,7 @@ pub fn hold_wait(queue: *mut c_void, fence: usize, value: u64) -> bool {
 /// Whether the operation at the front of a queue can go now.
 unsafe fn ready(op: &Op) -> bool {
     match op {
-        Op::Execute { lists, wait, since } => {
+        Op::Execute { lists, wait, since, .. } => {
             if since.elapsed() >= HOLD_LIMIT {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -167,18 +170,57 @@ pub unsafe fn release() {
             found
         };
         let Some((queue, op)) = next else { return };
-        RELEASING.with(|r| r.set(true));
-        let q = queue as *mut c_void;
-        match op {
-            Op::Execute { lists, .. } => {
-                let raw: Vec<*mut c_void> = lists.iter().map(|&l| l as *mut c_void).collect();
-                super::real::execute_held(q, &raw);
-            }
-            Op::Signal { fence, value, x } => super::real::signal_held(q, fence, value, x),
-            Op::Wait { fence, value } => super::real::wait_held(q, fence, value),
-        }
-        RELEASING.with(|r| r.set(false));
+        run(queue, op);
     }
+}
+
+/// The title resets `list` (a console, title or PC list): if it is held, it and what is held before
+/// it on its queue go to the GPU now – as it would have without holding (a GPU wait). On the
+/// console a submitted list is the GPU's at once and its object can be recorded again; submitted
+/// later, GTA VI's re-recorded list removed the device (0x887a0001, half a second after the first
+/// hold).
+pub unsafe fn flush_list(list: usize) {
+    if HOLDING.load(Ordering::Acquire) == 0 || releasing() {
+        return;
+    }
+    let _pump = PUMP.lock().unwrap();
+    let ops: Vec<(usize, Op)> = {
+        let mut g = HELD.lock().unwrap();
+        let Some(m) = g.as_mut() else { return };
+        let Some((&queue, at)) = m.iter().find_map(|(q, ops)| {
+            ops.iter().position(|op| matches!(op, Op::Execute { lists, pc, .. } if lists.contains(&list) || pc.contains(&list))).map(|i| (q, i))
+        }) else {
+            return;
+        };
+        let q = m.get_mut(&queue).unwrap();
+        let taken: Vec<(usize, Op)> = q.drain(..=at).map(|op| (queue, op)).collect();
+        if q.is_empty() {
+            HOLDING.fetch_sub(1, Ordering::AcqRel);
+        }
+        taken
+    };
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        crate::xlog_info!("D3D12.X: a held list is reset by the title: {} held operations go now", ops.len());
+    }
+    for (queue, op) in ops {
+        run(queue, op);
+    }
+}
+
+/// Submit one released operation (straight through: not held again).
+unsafe fn run(queue: usize, op: Op) {
+    RELEASING.with(|r| r.set(true));
+    let q = queue as *mut c_void;
+    match op {
+        Op::Execute { lists, .. } => {
+            let raw: Vec<*mut c_void> = lists.iter().map(|&l| l as *mut c_void).collect();
+            super::real::execute_held(q, &raw);
+        }
+        Op::Signal { fence, value, x } => super::real::signal_held(q, fence, value, x),
+        Op::Wait { fence, value } => super::real::wait_held(q, fence, value),
+    }
+    RELEASING.with(|r| r.set(false));
 }
 
 /// The thread that releases what CPU writes or the time limit let go (no submission follows).
@@ -200,7 +242,7 @@ mod tests {
     #[test]
     fn a_queue_with_something_held_keeps_its_later_operations_in_order() {
         let (a, b) = (0x5100_0001usize, 0x5100_0002usize);
-        push(a, Op::Execute { lists: vec![1], wait: Some((0x1000, 5)), since: Instant::now() });
+        push(a, Op::Execute { lists: vec![1], pc: vec![2], wait: Some((0x1000, 5)), since: Instant::now() });
         assert!(queue_held(a));
         assert!(!queue_held(b));
         assert!(hold_signal(a as *mut c_void, 0x77, 3, false));

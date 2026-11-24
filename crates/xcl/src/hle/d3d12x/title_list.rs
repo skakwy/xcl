@@ -145,6 +145,7 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
 /// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
 /// any extra split segments into the per-list spare pool.
 unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
+    super::hold::flush_list(this as usize);
     let primary = *((this as usize + F_PRIMARY) as *const *mut c_void);
     let hr = if super::real::is_adopted(primary) {
         super::list_x::reset_x(primary, alloc, pso)

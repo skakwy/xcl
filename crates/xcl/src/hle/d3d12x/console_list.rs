@@ -414,6 +414,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
+    super::hold::flush_list(this as usize);
     let obj = this as usize;
     let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
         st.chunks.clear();
