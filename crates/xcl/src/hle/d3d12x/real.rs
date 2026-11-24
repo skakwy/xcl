@@ -5102,8 +5102,6 @@ const QUEUE_FIRST: usize = 14;
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
 /// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
 unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    const PC_SIGNAL: usize = 14;
-    const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
     const PC_CLOCK_CALIBRATION: usize = 17;
     const PC_GET_DESC: usize = 18;
@@ -5120,21 +5118,12 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     match older {
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
-            if older == 14 {
-                super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
+            // behind a submission held back (`hold`): kept in order with it
+            let held = if older == 14 { super::hold::hold_signal(this, a1, a2 as u64, false) } else { super::hold::hold_wait(this, a1, a2 as u64) };
+            if held {
+                return 0;
             }
-            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            let hr = f(this, a1, a2);
-            if hr >= 0 {
-                if older == 14 {
-                    super::fence_x::note_queue_signal(a1, a2 as u64);
-                    super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
-                } else {
-                    super::fence_x::note_queue_wait(a1, a2 as u64);
-                    super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
-                }
-            }
-            hr as u32 as usize
+            (if older == 14 { queue_signal(this, a1, a2 as u64) } else { queue_wait(this, a1, a2 as u64) }) as u32 as usize
         }
         16 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));
@@ -5223,6 +5212,14 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// nothing left Fortnite's render fences pending: its render thread waited, textures were
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
+    if super::hold::hold_signal(this, fence as usize, value, true) {
+        return 0;
+    }
+    q_signal_x_now(this, fence, value)
+}
+
+/// `q_signal_x` on the GPU now.
+unsafe fn q_signal_x_now(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
     const PC_SIGNAL: usize = 14;
     super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
@@ -5242,12 +5239,60 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
     hr
 }
 
+/// The title's Signal on a queue, on the GPU now (queue #14 in the older numbering).
+unsafe fn queue_signal(this: *mut c_void, fence: usize, value: u64) -> i32 {
+    const PC_SIGNAL: usize = 14;
+    super::list_x::break_cycles_before_title_signal(this as usize, fence, value);
+    let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(orig_fn(this, PC_SIGNAL));
+    let hr = f(this, fence, value as usize);
+    if hr >= 0 {
+        super::fence_x::note_queue_signal(fence, value);
+        super::list_x::note_title_queue_signal(this as usize, fence, value);
+    }
+    hr
+}
+
+/// The title's Wait on a queue, on the GPU now (queue #15 in the older numbering).
+unsafe fn queue_wait(this: *mut c_void, fence: usize, value: u64) -> i32 {
+    const PC_WAIT: usize = 15;
+    let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(orig_fn(this, PC_WAIT));
+    let hr = f(this, fence, value as usize);
+    if hr >= 0 {
+        super::fence_x::note_queue_wait(fence, value);
+        super::list_x::note_title_queue_wait(this as usize, fence, value);
+    }
+    hr
+}
+
+/// A submission `hold` kept back, submitted now.
+pub(super) unsafe fn execute_held(this: *mut c_void, lists: &[*mut c_void]) {
+    q_execute_command_lists(this, lists.len() as u32, lists.as_ptr());
+}
+
+/// A Signal / SignalX `hold` kept back, on the GPU now.
+pub(super) unsafe fn signal_held(this: *mut c_void, fence: usize, value: u64, x: bool) {
+    if x {
+        q_signal_x_now(this, fence as *mut c_void, value);
+    } else {
+        queue_signal(this, fence, value);
+    }
+}
+
+/// A Wait `hold` kept back, on the GPU now.
+pub(super) unsafe fn wait_held(this: *mut c_void, fence: usize, value: u64) {
+    queue_wait(this, fence, value);
+}
+
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
+        return;
+    }
+    // a list waiting for a value no submitted list writes yet waits here, not on the GPU
+    if super::hold::hold_execute(this, n, lists) {
         return;
     }
     let t0 = std::time::Instant::now();
@@ -5292,6 +5337,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
+    // what was held for these lists' writes goes now
+    super::hold::release();
     // a submit that held the title's thread for long: where the time went
     let total = t0.elapsed();
     if total.as_millis() >= 100 {

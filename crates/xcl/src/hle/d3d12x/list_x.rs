@@ -1118,6 +1118,48 @@ pub(super) fn queue_has_armed_wait(queue: usize) -> bool {
     gr.cells.values_mut().any(|c| c.armed_waits.iter().any(|a| a.waiting_queue == queue) && unsafe { prune_completed_waits(c) } != u64::MAX && c.armed_waits.iter().any(|a| a.waiting_queue == queue))
 }
 
+/// The first wait of `lists` (PC lists, in submission order) on a value no list has been submitted
+/// to write yet, though one is recorded to (`hold`): (address, value). A wait the memory already
+/// satisfies, or a write by an earlier list of the same batch (or the same list), does not count.
+pub(super) unsafe fn unsubmitted_wait(lists: &[*mut c_void]) -> Option<(u64, u64)> {
+    if PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
+        let g = LISTS.lock().unwrap();
+        lists.iter().map(|&l| g.as_ref().and_then(|m| m.get(&(l as usize))).map(|s| (s.pending_waits.clone(), s.write64_signals.clone())).unwrap_or_default()).collect()
+    };
+    let mut batch_writes: Vec<(u64, u64)> = Vec::new();
+    for (waits, writes) in per_list {
+        for w in &waits {
+            if w.width != 8 || w.comparison != D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32 || w.mask != u64::MAX || w.is_satisfied() {
+                continue;
+            }
+            if batch_writes.iter().chain(writes.iter()).any(|&(va, v)| va == w.va && v >= w.value) {
+                continue;
+            }
+            let g = SYNC_GRAPH.lock().unwrap();
+            let Some(c) = g.as_ref().and_then(|gr| gr.cells.get(&w.va)) else { continue };
+            if !c.non_monotonic && c.recorded_max >= w.value && c.submitted_max < w.value && c.cpu_signaled_max < w.value {
+                return Some((w.va, w.value));
+            }
+        }
+        batch_writes.extend(writes);
+    }
+    None
+}
+
+/// Whether the wait `(va, value)` a held list was held for can go now: the memory holds it, a
+/// list writing it was submitted, or it was released on the CPU.
+pub(super) unsafe fn wait_released(va: u64, value: u64) -> bool {
+    let w = PendingWait { va, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value, mask: u64::MAX, after_write64: false };
+    if w.is_satisfied() {
+        return true;
+    }
+    let g = SYNC_GRAPH.lock().unwrap();
+    g.as_ref().and_then(|gr| gr.cells.get(&va)).is_none_or(|c| c.submitted_max >= value || c.cpu_signaled_max >= value)
+}
+
 /// The short id title queues have in the sync log lines.
 pub(super) fn queue_label(q: usize) -> usize {
     queue_id(q)
