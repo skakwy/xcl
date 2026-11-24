@@ -75,7 +75,18 @@ fn describe_fault_address(a: usize) -> String {
             MEM_FREE => "free",
             _ => "?",
         };
-        format!(", {state} (protect {:#x}), region {:#x}+{:#x} of allocation {:#x}", m.Protect, m.BaseAddress as usize, m.RegionSize, m.AllocationBase as usize)
+        let mut t = format!(", {state} (protect {:#x}), region {:#x}+{:#x} of allocation {:#x}", m.Protect, m.BaseAddress as usize, m.RegionSize, m.AllocationBase as usize);
+        // a fault on the first page of its region: the memory just below (a copy past its end?)
+        let base = m.BaseAddress as usize;
+        let mut p: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if a - base < 0x1000 && base > 0 && unsafe { VirtualQuery((base - 1) as *const c_void, &mut p, std::mem::size_of_val(&p)) } != 0 {
+            let home = if crate::hle::kernelx::physical_page_at(base - 1) { ", a physical page away from its home" } else { "" };
+            t.push_str(&format!(
+                "; below it: region {:#x}+{:#x}, state {:#x}, protect {:#x}, type {:#x}{home}",
+                p.BaseAddress as usize, p.RegionSize, p.State, p.Protect, p.Type
+            ));
+        }
+        t
     };
     if let Some(u) = crate::gpu::uma::get() {
         if u.is_sparse(a) {
@@ -96,6 +107,9 @@ fn describe_fault_address(a: usize) -> String {
     }
     if crate::hle::kernelx::physical_page_at(a) {
         s.push_str(", a physical page is mapped there away from its home");
+    }
+    if let Some(h) = crate::hle::kernelx::describe_home(a) {
+        s.push_str(&format!(", {h}"));
     }
     s
 }

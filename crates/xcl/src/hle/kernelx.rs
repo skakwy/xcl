@@ -935,6 +935,23 @@ fn page_number(index: usize) -> usize {
     (index + 1) * FRAMES
 }
 
+/// For a crash line: whether `va` is the home of a physical page – allocated or freed, and where
+/// it is mapped now if it moved away (its home is decommitted then). None: no page's home.
+pub fn describe_home(va: usize) -> Option<String> {
+    let blocks = PHYS_BLOCKS.try_lock().ok()?;
+    let (&first, block) = blocks.iter().find(|(_, b)| va >= b.home && va < b.home + b.count * PHYS_PAGE)?;
+    let offset = (va - block.home) / PHYS_PAGE;
+    let page = (first + offset + 1) * FRAMES;
+    let (live, count, home) = (block.is_live(offset), block.count, block.home);
+    drop(blocks);
+    let away = AWAY.try_lock().ok().and_then(|g| g.as_ref().and_then(|a| a.page.get(&page).copied()));
+    Some(format!(
+        "the home of physical page {page:#x} ({}; its block: {count} pages from {home:#x}), {}",
+        if live { "allocated" } else { "freed" },
+        away.map_or("not mapped elsewhere".to_string(), |at| format!("now mapped at {at:#x}"))
+    ))
+}
+
 fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
