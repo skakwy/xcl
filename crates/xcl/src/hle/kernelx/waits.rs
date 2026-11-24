@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use windows_sys::Win32::System::Threading as th;
@@ -43,6 +44,15 @@ struct Waiting {
     from: String,
     timeout: u32,
     all: bool,
+}
+
+/// set by the monitor while the title has presented before and not for 3 s
+static STALLED: AtomicBool = AtomicBool::new(false);
+
+/// The title has presented before but not for 3 s or more (starts the monitor that tells).
+pub fn stalled() -> bool {
+    monitor();
+    STALLED.load(Ordering::Relaxed)
 }
 
 static OBJS: Mutex<Option<HashMap<usize, Obj>>> = Mutex::new(None);
@@ -108,13 +118,17 @@ fn monitor() {
                 let presents = crate::hle::d3d12x::present::counters().0;
                 if presents != last {
                     (last, since, reported) = (presents, Instant::now(), false);
+                    STALLED.store(false, Ordering::Relaxed);
                     continue;
                 }
                 if reported || presents == 0 || since.elapsed().as_secs() < 3 {
                     continue;
                 }
                 reported = true;
-                report(since.elapsed().as_secs());
+                STALLED.store(true, Ordering::Relaxed);
+                if on() {
+                    report(since.elapsed().as_secs());
+                }
             }
         });
     });

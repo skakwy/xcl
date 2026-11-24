@@ -265,9 +265,12 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
 /// logged). Comma-separated: `1`/`hle` – every HLE function (the default); `all` – system
 /// functions too (a data export imported from a system DLL would be wrapped as well, so this
 /// is for short runs); any other word – a prefix of `dll!Function` to include, `-word` one to
-/// exclude (e.g. `hle,-kernelx!GetTickCount,gameinput`).
+/// exclude (e.g. `hle,-kernelx!GetTickCount,gameinput`); `stall` – log only while the title has
+/// not presented for 3 s, at most 20 calls per thread, function and call site (what a title
+/// that stopped presenting keeps calling).
 struct TraceFilter {
     hle: bool,
+    stall: bool,
     all: bool,
     include: Vec<String>,
     exclude: Vec<String>,
@@ -278,11 +281,12 @@ fn trace_filter() -> Option<&'static TraceFilter> {
     FILTER
         .get_or_init(|| {
             let v = std::env::var("XCL_TRACE_IMPORTS").ok()?;
-            let mut f = TraceFilter { hle: false, all: false, include: Vec::new(), exclude: Vec::new() };
+            let mut f = TraceFilter { hle: false, stall: false, all: false, include: Vec::new(), exclude: Vec::new() };
             for w in v.split(',').map(|w| w.trim().to_ascii_lowercase()).filter(|w| !w.is_empty()) {
                 match w.as_str() {
                     "1" | "hle" => f.hle = true,
                     "all" => f.all = true,
+                    "stall" => f.stall = true,
                     _ => match w.strip_prefix('-') {
                         Some(x) => f.exclude.push(x.to_string()),
                         None => f.include.push(w),
@@ -295,6 +299,11 @@ fn trace_filter() -> Option<&'static TraceFilter> {
             Some(f)
         })
         .as_ref()
+}
+
+/// `XCL_TRACE_IMPORTS` has `stall`: traced calls are logged only during a stall.
+pub fn trace_only_in_stalls() -> bool {
+    trace_filter().is_some_and(|f| f.stall)
 }
 
 impl TraceFilter {

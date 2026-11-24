@@ -142,6 +142,9 @@ const CALL_STACK_ARGS: usize = 8;
 /// arguments at +0x20.., the entry rcx, rdx, r8, r9 at +0x60.., rax at +0x80, the caller's
 /// return address at +0xA8.
 unsafe extern "system" fn trace_ret(caller: usize, name: *const String, frame: *const u64) {
+    if crate::resolver::trace_only_in_stalls() && !stall_sample(name as usize, caller) {
+        return;
+    }
     let at = |off: usize| *frame.add(off / 8);
     let (a1, a2, a3, a4) = (at(0x60), at(0x68), at(0x70), at(0x78));
     let (a5, a6, ret) = (at(0x20), at(0x28), at(0x80));
@@ -154,6 +157,23 @@ unsafe extern "system" fn trace_ret(caller: usize, name: *const String, frame: *
         describe_ptr(a3),
         describe_ptr(a4)
     );
+}
+
+/// `XCL_TRACE_IMPORTS=stall,…`: whether this call is logged – only while the title has stopped
+/// presenting, and at most `STALL_CALLS` times per thread, function and call site.
+fn stall_sample(name: usize, caller: usize) -> bool {
+    const STALL_CALLS: u32 = 20;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashMap<(u32, usize, usize), u32>>> = Mutex::new(None);
+    if !crate::hle::kernelx::waits::stalled() {
+        return false;
+    }
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let mut seen = SEEN.lock().unwrap();
+    let n = seen.get_or_insert_with(HashMap::new).entry((tid, name, caller)).or_insert(0);
+    *n += 1;
+    *n <= STALL_CALLS
 }
 
 /// A tracer that logs the arguments *and the result* of every call (`XCL_TRACE_IMPORTS`): it
