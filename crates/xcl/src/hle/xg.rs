@@ -11,7 +11,8 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, src, ?, row pitch, slice pitch) – one argument
+//!   more before the pitches than CopyIntoSubresource (seen in GTA VI's calls), then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -695,7 +696,12 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32, next: u64) -> HRESULT {
+///
+/// The console's method has an argument between the source and the pitches (`_unknown`; GTA VI
+/// passes a value that is no pitch there). Read as the pitches, the row pitch was that value
+/// and the slice pitch the real row pitch: rows went gigabytes apart and the copy wrote past
+/// the title's memory (its crash in memcpy, #646).
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, _unknown: u64, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
@@ -710,7 +716,7 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 12 || !mapped {
             crate::xlog_warn!(
-                "XG CopyFromSubresource #{n}: dst {:#x}..{end:#x} ({}), plane {plane:#x}, sub {sub:#x} (level {i}, slice {k}), src {:#x}, {}x{} elements x {} B (row {row} B), depth {}, row pitch {row_pitch:#x}, slice pitch {slice_pitch:#x}, next stack slot {next:#x}, texture {}x{} bpe {} side {}",
+                "XG CopyFromSubresource #{n}: dst {:#x}..{end:#x} ({}), plane {plane:#x}, sub {sub:#x} (level {i}, slice {k}), src {:#x}, {}x{} elements x {} B (row {row} B), depth {}, row pitch {row_pitch:#x}, slice pitch {slice_pitch:#x}, argument before the pitches {_unknown:#x}, texture {}x{} bpe {} side {}",
                 dst as usize,
                 if mapped { "last row mapped" } else { "LAST ROW NOT MAPPED" },
                 src as usize,
@@ -724,7 +730,7 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
                 t.side
             );
         }
-        // (experiment: such a copy is refused rather than written into memory nobody has)
+        // a copy whose last row is not memory the title has is refused, not written
         if !mapped {
             return E_INVALIDARG;
         }
@@ -760,6 +766,28 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    /// CopyFromSubresource takes its pitches after one more argument: rows land `row_pitch`
+    /// apart and nothing past the last row is written, whatever that argument holds.
+    #[test]
+    fn copy_from_takes_the_pitches_after_its_fifth_argument() {
+        let mut computer: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(desc(256, 256, 1, 1, 28, 0x109).as_ptr(), &mut computer), S_OK);
+            let size = tex(computer).size() as usize;
+            let src: Vec<u8> = (0..size).map(|i| (i % 251) as u8 + 1).collect();
+            let (row, pitch) = (256 * 4, 256 * 4 + 64);
+            let mut dst = vec![0u8; 255 * pitch + row + 4096];
+            let hr = copy_from(computer, dst.as_mut_ptr(), 0, 0, src.as_ptr(), row as u64, pitch as u32, (256 * pitch) as u32);
+            assert_eq!(hr, S_OK);
+            for y in 0..255 {
+                assert!(dst[y * pitch..y * pitch + row].iter().any(|&b| b != 0), "row {y} written");
+                assert!(dst[y * pitch + row..(y + 1) * pitch].iter().all(|&b| b == 0), "padding after row {y} untouched");
+            }
+            assert!(dst[255 * pitch + row..].iter().all(|&b| b == 0), "nothing past the last row");
+            release(computer);
+        }
     }
 
     /// As the console's library answers (seen on it): RGBA8 256×256, full chain, 64KB_S.
