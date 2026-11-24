@@ -296,7 +296,15 @@ unsafe fn bcpack_fill_inner(r: &Request, target: &FillTarget) -> bool {
     let n = r.destination_size as usize;
     let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
     let ok = match target {
-        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
+        FillTarget::Pages(pages) => {
+            // (entries 0 at enqueue are read again now, as `execute` does)
+            let late: Vec<usize> = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(&pages[..])) {
+                (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect()
+            } else {
+                pages.clone()
+            };
+            crate::hle::kernelx::write_physical_pages(&late, r.destination_page_offset as usize, &bytes)
+        }
         FillTarget::Virtual => {
             if !writable(r.destination as usize, n) {
                 return false;
@@ -1036,6 +1044,16 @@ struct QueueInner {
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        // the failures that are not BCPack (no decoder yet): the first 24, with the request
+        if hr != E_DECOMPRESSION {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 24 {
+                crate::xlog_warn!(
+                    "DirectStorage: request failed ({hr:#x}): {request:x?} from '{}'",
+                    file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default()
+                );
+            }
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
