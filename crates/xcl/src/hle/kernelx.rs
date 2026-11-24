@@ -150,6 +150,12 @@ pub fn sanitize_protect(p: u32) -> u32 {
 /// – where it maps physical pages (a texture streaming pool): base → size. Write-watched, like
 /// unified memory, so textures in it follow CPU writes (`d3d12x::title_textures`).
 static GRAPHICS_RESERVATIONS: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether `base` is a GPU-visible reservation of the title in plain memory (the memory line's
+/// list of the largest allocations).
+pub fn is_title_graphics_reservation(base: usize) -> bool {
+    GRAPHICS_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&base)
+}
 static GRAPHICS_RESERVATIONS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Generation counter incremented whenever `GRAPHICS_RESERVATIONS` changes.
