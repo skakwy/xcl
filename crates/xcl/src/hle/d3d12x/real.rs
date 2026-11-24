@@ -432,6 +432,26 @@ pub fn video_memory() -> Option<(u64, u64)> {
     }
 }
 
+/// Whether `extra` more bytes of local video memory would take the process past the budget
+/// Windows gives it (then the driver pages video memory in and out at every submit). `false`
+/// when it cannot be asked.
+pub fn local_memory_tight(extra: u64) -> bool {
+    use windows::Win32::Graphics::Dxgi::*;
+    static ADAPTER: std::sync::OnceLock<Option<IDXGIAdapter3>> = std::sync::OnceLock::new();
+    let adapter = ADAPTER.get_or_init(|| unsafe {
+        let raw = device_raw();
+        let dev = ID3D12Device::from_raw_borrowed(&raw)?;
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        factory.EnumAdapterByLuid(dev.GetAdapterLuid()).ok()
+    });
+    let Some(adapter) = adapter else { return false };
+    let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    if unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local) }.is_err() {
+        return false;
+    }
+    local.CurrentUsage + extra > local.Budget
+}
+
 /// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
 /// split form (`Options::split_wave64`). Unknown device: assume so.
 fn wave32_only(device: *mut c_void) -> bool {

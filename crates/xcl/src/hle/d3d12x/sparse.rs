@@ -574,14 +574,41 @@ impl State {
         if let Some(t) = self.free.pop() {
             return Some((t, true));
         }
-        let desc = D3D12_HEAP_DESC {
+        let mut desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
+        // `XCL_SPARSE_SPILL=1`: a pool that would take the process past its video memory budget
+        // is made in system memory (the GPU reads its tiles over the bus) – on an 8 GB card a
+        // retail game's pools and targets went past it and every submit waited for the driver
+        // to page, until the title's own watchdog ended it
+        static SPILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let spill = *SPILL.get_or_init(|| std::env::var("XCL_SPARSE_SPILL").is_ok_and(|v| v.trim() == "1"))
+            && super::real::local_memory_tight(desc.SizeInBytes + (512 << 20));
+        if spill {
+            desc.Properties = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+        }
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
+        let mut made = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap));
+        if spill {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 2 || n.is_power_of_two() {
+                crate::xlog_info!("sparse windows: video memory budget reached – pool in system memory ({n} so far, {})", if made.is_ok() { "made" } else { "refused, in video memory" });
+            }
+            if made.is_err() {
+                desc.Properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                made = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap));
+            }
+        }
+        if let Err(e) = made {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }
